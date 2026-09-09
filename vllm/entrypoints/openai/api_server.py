@@ -150,6 +150,9 @@ async def build_async_engine_client_from_engine_args(
     # Create the EngineConfig (determines if we can use V1).
     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
 
+    # AsyncLLM 是 API server 进程中与 EngineCore 进程通信的 client。
+    # AsyncLLM 实现 EngineClient 协议，并通过 EngineCoreClient 与 EngineCore 交互。
+
     from vllm.v1.engine.async_llm import AsyncLLM
 
     async_llm: AsyncLLM | None = None

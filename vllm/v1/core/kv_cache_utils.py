@@ -2123,6 +2123,7 @@ def get_kv_cache_configs(
             if layer_name not in merged_kv_cache_specs:
                 merged_kv_cache_specs[layer_name] = layer_spec
             else:
+                # 同一层在不同 TP rank 的 KV cache spec 必须一致。
                 assert merged_kv_cache_specs[layer_name] == layer_spec, (
                     "The KV cache specs for the same layer are different "
                     "across workers. This is not supported yet."

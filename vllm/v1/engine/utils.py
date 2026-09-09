@@ -155,6 +155,7 @@ class CoreEngineProcManager:
 
         self.processes: list[BaseProcess] = []
         local_dp_ranks = []
+        # local_engine_count 表示当前节点上的 DP engine 数量。
         for index in range(local_engine_count):
             local_index = local_start_index + index
             global_index = start_index + index

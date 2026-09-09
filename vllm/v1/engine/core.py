@@ -104,6 +104,7 @@ _R = TypeVar("_R")  # Return type for collective_rpc
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
+    # 纯引擎逻辑，不负责进程间通信；负责组装 executor、KV cache 和 scheduler。
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -112,6 +113,7 @@ class EngineCore:
         executor_fail_callback: Callable | None = None,
         include_finished_set: bool = False,
     ):
+        # 初始化 model_executor、scheduler，并建立 KV cache。
         # plugins need to be loaded at the engine/scheduler level too
         from vllm.plugins import load_general_plugins
 
@@ -130,6 +132,9 @@ class EngineCore:
         self._weight_version = "default"
 
         # Setup Model.
+        # model_executor 统一负责调度 Worker 并触发模型计算；
+        # 底层可以是单进程、多进程或 Ray executor。
+        # executor 初始化阶段会完成模型权重加载。
         self.model_executor = executor_class(vllm_config)
         self._pooler_config_logged = False
         if executor_fail_callback is not None:
@@ -141,10 +146,12 @@ class EngineCore:
             self._eep_scale_up_before_kv_init()
 
         # Setup KV Caches and update CacheConfig after profiling.
+        # 初始化 KV cache；内部会进行显存 profiling。
         kv_cache_config = self._initialize_kv_caches(vllm_config)
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
         # Setup scheduler.
+        # 根据配置选择同步或异步 scheduler。
         Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
 
         if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
@@ -171,6 +178,7 @@ class EngineCore:
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
         )
+        # KV connector 的输出聚合器由 model_executor 初始化。
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
         if self.scheduler.ec_connector is not None:  # type: ignore
@@ -254,9 +262,11 @@ class EngineCore:
         start = time.time()
 
         # register all kvcache specs in enginecore process.
+        # 注册 KV cache spec，供 EngineCore 和 scheduler 使用。
         register_all_kvcache_specs(vllm_config)
 
         # Get all kv cache needed by the model
+        # 获取每个 Worker 的 KV cache spec，返回 list[dict[layer_name, KVCacheSpec]]。
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
 
         # Some layers (e.g. Prefix LM attention) run non-causally and tag their
@@ -293,12 +303,14 @@ class EngineCore:
             else:
                 # Profiles the peak memory usage of the model to determine how
                 # much memory can be allocated for kv cache.
+                # 这里完成模型显存 profiling，并计算 KV cache 可用显存。
                 available_gpu_memory = self.model_executor.determine_available_memory()
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
         else:
             # Attention free models don't need memory for kv cache
             available_gpu_memory = [0] * len(kv_cache_specs)
 
+        # 每个 Worker 都需要一份对应的可用显存数据。
         assert len(kv_cache_specs) == len(available_gpu_memory)
 
         # Track max_model_len before KV cache config to detect auto-fit changes
@@ -326,6 +338,7 @@ class EngineCore:
 
         vllm_config.validate_block_size()
 
+        # 初始化 KV cache；下一步完成模型编译和 warmup。
         self.model_executor.initialize_from_config(kv_cache_configs)
         if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self.model_executor.compile_or_warm_up_model()
@@ -587,11 +600,14 @@ class EngineCore:
         was executed.
         """
 
+        # 负责调度 -> 执行 -> 返回输出。
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        # 调度器决定本轮需要计算哪些请求和 token。
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        # 异步触发 Worker 的前向计算。
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -600,6 +616,7 @@ class EngineCore:
         ):
             model_output = future.result()
             if model_output is None:
+                # None 表示需要走 sample_tokens()，不代表没有模型输出。
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
         # Before processing the model output, process any aborts that happened
@@ -638,6 +655,7 @@ class EngineCore:
         3. Update the scheduler from the output.
         """
 
+        # batch_queue 将调度与模型执行重叠，以减少 PP/异步调度的 pipeline bubble。
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
@@ -765,6 +783,7 @@ class EngineCore:
         cleanup_dist_env_and_memory()
         logger.debug_once("[shutdown] EngineCore: local resource teardown complete")
 
+    # torch/nsys profiler entry point.
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         self.model_executor.profile(is_start, profile_prefix)
 
@@ -1023,6 +1042,7 @@ class EngineCoreProc(EngineCore):
         *,
         engine_index: int = 0,
     ):
+        # Step 1：创建进程内的输入/输出队列。
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
         executor_fail_callback = lambda: self.input_queue.put_nowait(
@@ -1070,6 +1090,7 @@ class EngineCoreProc(EngineCore):
             self.process_input_queue_block = True
             self._init_data_parallel(vllm_config)
 
+            # Step 2：完成 EngineCore 初始化。
             super().__init__(
                 vllm_config,
                 executor_class,
@@ -1088,12 +1109,14 @@ class EngineCoreProc(EngineCore):
                     parallel_config=vllm_config.parallel_config,
                 )
 
+            # Step 3：启动 ZMQ I/O 线程。
             # Background Threads and Queues for IO. These enable us to
             # overlap ZMQ socket IO with GPU since they release the GIL,
             # and to overlap some serialization/deserialization with the
             # model forward pass.
             # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
             ready_event = threading.Event()
+            # ZMQ -> input_queue：接收 API server 或 coordinator 的请求。
             input_thread = threading.Thread(
                 target=self.process_input_sockets,
                 args=(
@@ -1106,6 +1129,7 @@ class EngineCoreProc(EngineCore):
             )
             input_thread.start()
 
+            # output_queue -> ZMQ：向 API server 或 coordinator 发送结果。
             self.output_thread = threading.Thread(
                 target=self.process_output_sockets,
                 args=(
@@ -1374,6 +1398,7 @@ class EngineCoreProc(EngineCore):
     @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
+        # 非 DP 版本的 EngineCore 主循环：处理请求并不断执行 engine step。
         while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
@@ -1434,7 +1459,7 @@ class EngineCoreProc(EngineCore):
 
         # Step the engine core.
         outputs, model_executed = self.step_fn()
-        # Put EngineCoreOutputs into the output queue.
+        # 将 EngineCoreOutputs（token/元数据，不是最终文本）放入 output_queue。
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
         # Post-step hook.
@@ -2146,6 +2171,7 @@ class DPEngineCoreProc(EngineCoreProc):
     @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""
+        # DP 版本的 EngineCore 主循环，还要同步各个 DP rank 的状态。
 
         # Loop until process is sent a SIGINT or SIGTERM
         while self._handle_shutdown():

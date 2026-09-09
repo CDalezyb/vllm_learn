@@ -929,6 +929,7 @@ class Worker(WorkerBase):
         return self.model_runner.get_encoder_timing_stats()
 
     def annotate_profile(self, scheduler_output):
+        # 在 execute_model() 中调用，为 profiler trace 添加本轮请求的阶段信息。
         # add trace annotation so that we can easily distinguish
         # context/generation request numbers in each iteration.
         # A context request is a request that has not yet generated any tokens

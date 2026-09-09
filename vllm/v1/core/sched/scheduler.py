@@ -107,6 +107,8 @@ class Scheduler(SchedulerInterface):
         self.prev_step_scheduled_req_ids: set[str] = set()
 
         # Scheduling constraints.
+        # max_num_scheduled_tokens 是 scheduler 的 token budget；
+        # speculative decoding 还会额外占用 draft slots。
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
         self.max_num_scheduled_tokens = (
             self.scheduler_config.max_num_scheduled_tokens
@@ -185,9 +187,11 @@ class Scheduler(SchedulerInterface):
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
         # Priority queues for requests.
+        # ① waiting：尚未分配 KV cache、等待调度的请求。
         self.waiting = create_request_queue(self.policy)
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
+        # ② running：已经分配资源、正在执行或等待执行的请求。
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -485,6 +489,8 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
+        # num_tokens_with_spec 是本轮希望追上的目标位置；
+        # num_computed_tokens 是当前已经推进到的位置，也可能乐观包含 in-flight token。
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -561,6 +567,7 @@ class Scheduler(SchedulerInterface):
                 - request.num_computed_tokens
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+                # 长 prefill 请求被切成多个调度 chunk。
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
@@ -641,6 +648,7 @@ class Scheduler(SchedulerInterface):
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
                     if self.policy == SchedulingPolicy.PRIORITY:
+                        # PRIORITY 模式驱逐优先级最低的 running 请求。
                         preempted_req = max(
                             self.running,
                             key=lambda r: (r.priority, r.arrival_time),
@@ -656,6 +664,7 @@ class Scheduler(SchedulerInterface):
                             req_index -= 1
 
                         if preempted_req in scheduled_running_reqs:
+                            # 如果驱逐了本轮已经调度的请求，需要撤回其预算、block 和 draft 信息。
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
@@ -675,6 +684,7 @@ class Scheduler(SchedulerInterface):
                                 )
                                 encoder_compute_budget += num_embeds_to_restore
                     else:
+                        # FCFS 模式从 running 尾部驱逐最近加入的请求。
                         preempted_req = self.running.pop()
 
                     self._preempt_request(
@@ -684,6 +694,7 @@ class Scheduler(SchedulerInterface):
                     )
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
+                        # 连自己都无法保留时，本轮无法继续调度该请求。
                         # No more request to preempt. Cannot schedule this request.
                         break
 
@@ -703,6 +714,11 @@ class Scheduler(SchedulerInterface):
 
             # Speculative decode related.
             if request.spec_token_ids:
+                # request.num_tokens：prompt 加上已接受的 output token，不含 draft token。
+                # request.spec_token_ids：draft model 提议、尚未验证的 token。
+                # request.num_tokens_with_spec：num_tokens 加上 draft token 数。
+                # request.num_computed_tokens：调度器已经推进的 token 数，可能含 draft 占位。
+                # request.num_output_placeholders：异步/投机解码预留的输出槽位。
                 num_scheduled_spec_tokens = (
                     num_new_tokens
                     + request.num_computed_tokens
@@ -748,6 +764,8 @@ class Scheduler(SchedulerInterface):
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
+            # waiting 和 skipped_waiting 都有请求、且还有 token 预算时，继续尝试调度。
+            # skipped_waiting 通常包含等待 KV 传输、结构化输出或 streaming 输入的请求。
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if input_budget <= draft_slots:
                     break
@@ -764,6 +782,7 @@ class Scheduler(SchedulerInterface):
                 request_id = request.request_id
 
                 # try to promote blocked statuses while traversing skipped queue.
+                # 请求处于阻塞状态且解阻塞失败时，本轮跳过并放回 step_skipped_waiting。
                 if self._is_blocked_waiting_status(
                     request.status
                 ) and not self._try_promote_blocked_waiting_request(request):
@@ -809,6 +828,7 @@ class Scheduler(SchedulerInterface):
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
+                    # 从未计算过的请求：可能是新请求，也可能是被驱逐后重算的请求。
                     did_prefix_cache_lookup = True
                     (
                         new_computed_blocks,
@@ -904,6 +924,8 @@ class Scheduler(SchedulerInterface):
                             num_external_cached_tokens=num_external_computed_tokens,
                         )
                 else:
+                    # 异步 KV load 期间会先设置 num_computed_tokens，但 KV 仍未完成传输；
+                    # 此时不再分配新的 computed blocks。
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
@@ -1112,6 +1134,7 @@ class Scheduler(SchedulerInterface):
                         )
                     continue
 
+                # 请求完成资源分配后进入 running 队列。
                 self.running.append(request)
                 if self.log_stats:
                     request.record_event(
@@ -1130,6 +1153,7 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
+                # 消耗本轮 token/input 预算，并更新请求的运行状态。
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
@@ -1159,6 +1183,7 @@ class Scheduler(SchedulerInterface):
 
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
+                # 更新 skipped_waiting，把本轮跳过的请求放回队头。
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
 
             # DP prefill balancing: on a step that admitted prefills (release),
@@ -1372,11 +1397,14 @@ class Scheduler(SchedulerInterface):
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
-        # Put the request back to the waiting queue.
+        # Put the request back to the front of the waiting queue.
+        # 被驱逐的请求会回到 waiting 队头，等待后续重新计算。
         self.waiting.prepend_request(request)
         self.reset_preempted_req_ids.add(request.request_id)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        # 本轮请求完成调度后推进 num_computed_tokens，避免影响本轮输入构建；
+        # scheduler_output 仍保留原始调度数量供 Worker 构建输入。
         # Advance the number of computed tokens for the request AFTER
         # the request is scheduled.
         # 1. The scheduler_output of the current step has to include the
@@ -2150,6 +2178,11 @@ class Scheduler(SchedulerInterface):
             self.waiting.add_request(request)
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
+        """Select the next request queue according to the scheduling policy.
+
+        FCFS 优先处理 skipped_waiting，再处理 waiting；PRIORITY 模式比较两个
+        队头，由 Request 的排序规则选择下一个请求。
+        """
         if self.policy == SchedulingPolicy.FCFS:
             return self.skipped_waiting or self.waiting or None
 
@@ -2305,16 +2338,20 @@ class Scheduler(SchedulerInterface):
             if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
                 assert existing.streaming_queue is not None, "duplicate request id"
                 # Queue next input chunk (or finished sentinel).
+                # A1：当前 chunk 尚未完成，先把下一段输入排队。
                 existing.streaming_queue.append(update)
             elif update is not None:
                 # Commence next input chunk.
+                # A2：当前 chunk 已完成，直接更新并开始下一段输入。
                 self._update_request_as_session(existing, update)
             else:
                 # Streaming-input session finished.
+                # A3：输入会话结束，终止请求。
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            # 新请求按状态加入 waiting 或 skipped_waiting 队列。
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.connector is not None:

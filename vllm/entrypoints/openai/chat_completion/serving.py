@@ -255,10 +255,12 @@ class OpenAIServingChat(GenerateBaseServing):
                 chat_template_kwargs=chat_template_kwargs,
                 model_config=self.model_config,
             )
+        # Tokenization 和 chat template 渲染发生在 API server 的 renderer 中。
         result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result
 
+        # engine_inputs 是待提交给引擎的 list[EngineInput]。
         conversation, engine_inputs = result
 
         request_id = (
@@ -301,6 +303,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 truncate_prompt_tokens=request.truncate_prompt_tokens,
             )
 
+            # 构建 sampling params。
             sampling_params: SamplingParams | BeamSearchParams
             if request.use_beam_search:
                 sampling_params = request.to_beam_search_params(
@@ -348,6 +351,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 else:
                     reasoning_ended = None
 
+                # 将 EngineInput 和 sampling params 提交给 AsyncLLM EngineClient。
                 generator = self.engine_client.generate(
                     engine_input,
                     sampling_params,
