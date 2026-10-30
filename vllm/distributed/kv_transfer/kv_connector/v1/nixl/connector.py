@@ -427,6 +427,22 @@ class NixlPushConnector(NixlBaseConnector):
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         self.connector_worker.start_load_kv(self._connector_metadata)
 
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        """Chunk-wise push: every runner binds each step's metadata before its
+        forward, also without one (see ``bind_chunkwise``)."""
+        super().bind_connector_metadata(connector_metadata)
+        if self.connector_worker is not None and self.connector_worker.chunkwise_push:
+            assert isinstance(connector_metadata, NixlConnectorMetadata)
+            self.connector_worker.bind_chunkwise(connector_metadata)
+
+    def wait_for_save(self):
+        """Chunk-wise push: queue the KV this step's forward completed."""
+        super().wait_for_save()
+        assert self.connector_worker is not None
+        if self.connector_worker.chunkwise_push:
+            assert isinstance(self._connector_metadata, NixlConnectorMetadata)
+            self.connector_worker.wait_for_save(self._connector_metadata)
+
 
 # Backward compatibility: NixlConnector is the pull-based connector.
 NixlConnector = NixlPullConnector

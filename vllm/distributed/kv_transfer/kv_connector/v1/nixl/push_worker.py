@@ -16,30 +16,51 @@ The handshake-completion callback feeds ``_deferred_push_inbox`` with
 matched pushes whose P→D handshake has finished so the writer can
 (re-)issue the WRITE without ever blocking on the network.
 
-Wake model: the writer self-polls every
-``_PUSH_WRITER_POLL_INTERVAL_MS`` only while it has unmatched
-``_push_finished_blocks`` (i.e. P-side blocks waiting for a D PUSH_REG
-notif that has no other wake source). All other progress is
-event-driven: the engine main thread sets ``_push_writer_wake`` from
-``start_load_kv`` (when handing it new work) and from ``get_finished``
-(so each engine step gives the writer a chance to drain NIXL notifs);
-the handshake-completion callback sets the same event after a deferred
-PUSH_REG send or a deferred push WRITE has been queued. When a request's
-lease expires (the base worker reports it via ``done_sending``) or the WRITE completes,
-``get_finished`` enqueues an eviction onto ``_evict_finished_inbox`` so
-the writer drops any leftover ``_push_finished_blocks`` /
-``_pending_d_registrations`` and stops self-polling.
+Wake model: the writer self-polls every ``_PUSH_WRITER_POLL_INTERVAL_MS``
+while something only polling reveals is pending: unmatched
+``_push_finished_blocks`` (P-side blocks waiting for a D PUSH_REG notif),
+whole-request WRITEs under ``push_writer_progress``, and chunk-wise pushes
+with WRITEs in flight or waiting for a PUSH_REG. When all that is left are
+chunk-wise WRITEs waiting for a step to be computed, it sleeps on that step's
+CUDA event (other work handed to it meanwhile waits until the step is
+computed). Otherwise it waits on ``_push_writer_wake``: the engine main thread
+sets it from ``start_load_kv`` (when handing it new work), from
+``get_finished`` (so each engine step gives the writer a chance to drain NIXL
+notifs) and, with chunk-wise push, from ``bind_chunkwise`` and
+``wait_for_save``; the handshake-completion callbacks set it after queueing a
+deferred PUSH_REG send, a deferred push WRITE or a chunk-wise "ready". When a
+request's lease expires (the base worker reports it via ``done_sending``) or
+the WRITE completes, ``get_finished`` enqueues an eviction onto
+``_evict_finished_inbox`` so the writer drops any leftover
+``_push_finished_blocks`` / ``_pending_d_registrations`` and stops
+self-polling.
+
+Chunk-wise push (P side, ``chunkwise_push``): instead of one WRITE after the
+prefill, ``wait_for_save`` queues a ``_ChunkTask`` per request at the end of
+every prefill step (chunk), with the blocks the step completed and a CUDA event
+recorded after the step's forward (``_cw_inbox``). The writer WRITEs them once
+the event fired (it never waits on one while it has other work), so chunk i's
+KV moves while chunk i+1 is computed (Mamba state only with the last chunk).
+Tasks queue up until D's PUSH_REG arrives. The request's last WRITE carries the
+completion notif. It is posted once all its earlier WRITEs are done, so D never
+sees the notif before the data, and once the next step's metadata was bound
+without cancelling the request (see ``bind_chunkwise``). Preempted requests,
+and requests to a D of other geometry, are pushed whole once finished.
 """
 
+import contextlib
 import queue
 import threading
 import time
-from collections import defaultdict
-from collections.abc import Sequence
+from collections import defaultdict, deque
+from collections.abc import Iterator, Sequence
 from concurrent.futures import Future
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import msgspec
+import numpy as np
+import torch
 
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -60,13 +81,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     ReadSpec,
     _is_attention_spec,
+    _is_ssm_spec,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import get_base_request_id
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    chunkwise_push_unsupported_reason,
+    match_request_id,
+)
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
-    import torch
-
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
@@ -77,6 +102,87 @@ logger = init_logger(__name__)
 # main thread (start_load_kv / get_finished). Smaller -> lower latency
 # while active, slightly more CPU.
 _PUSH_WRITER_POLL_INTERVAL_MS = 1.0
+# Chunk-wise push: longest wait, before a forward, for the final WRITE of a
+# request preempted or aborted since the last step (see bind_chunkwise).
+_CHUNKWISE_FENCE_TIMEOUT_S = 10.0
+
+
+@dataclass
+class _ChunkTask:
+    """WRITE of the KV one prefill step (chunk) completed for a request."""
+
+    req_id: ReqId
+    # Worker step count when queued, see _cw_final_due.
+    seq: int
+    # Kernel-block index of the request's first attention block in the task.
+    start: int
+    # Per group, kernel block ids of the attention blocks the step completed
+    # and, with the last chunk, of the Mamba state.
+    kernel_block_ids: BlockIds
+    num_prompt_tokens: int
+    # Last chunk: carries the Mamba state and the completion notif.
+    final: bool
+    # Recorded after the step's forward: the blocks are computed once it fires.
+    event: "torch.cuda.Event"
+
+
+@dataclass
+class _ChunkSignal:
+    """Writer control message for a chunk-wise request."""
+
+    req_id: ReqId
+    # "drop": aborted or lease gone; "fallback": preempted; "finished": the
+    # request finished (``blocks``); "ready": P->D handshake done (``error``).
+    kind: str
+    error: BaseException | None = None
+    # "drop" / "fallback": set once the request's in-flight WRITEs are done.
+    fence: threading.Event | None = None
+    blocks: BlockIds | None = None
+
+
+@dataclass
+class _ChunkwiseWrite:
+    """Writer-thread state of one chunk-wise request."""
+
+    num_prompt_tokens: int
+    reg: dict[str, Any] | None = None
+    # Handshaked and geometry resolved.
+    ready: bool = False
+    # D's geometry rules out chunk-wise WRITEs: pushed whole once finished.
+    monolithic: bool = False
+    # "drop" (aborted, lease gone) or "fallback" (preempted, pushed whole).
+    cancelled: str | None = None
+    failed: bool = False
+    # The final WRITE (with D's notif) was posted.
+    final_posted: bool = False
+    # Tasks not WRITTEN yet, in step order.
+    pending: deque[_ChunkTask] = field(default_factory=deque)
+    handles: list[TransferHandle] = field(default_factory=list)
+    # Cancellation fences, set once the in-flight WRITEs are done.
+    fences: list[threading.Event] = field(default_factory=list)
+    # The request's block table once it finished, for a whole-request push.
+    finished_blocks: BlockIds | None = None
+    # Resolved on ``ready``.
+    dst_engine_id: str = ""
+    local_handle: int = 0
+    remote_handle: int = 0
+    remote_agent: str = ""
+    remote_physical_per_logical: int = 1
+    notif: bytes = b""
+    remote_block_ids: BlockIds = ()
+    # Attention kernel-block offset between P's and D's block lists (D only
+    # allocates the suffix it has not cached).
+    fa_offset: int = 0
+
+    @property
+    def pushing(self) -> bool:
+        """Neither cancelled nor failed."""
+        return self.cancelled is None and not self.failed
+
+    @property
+    def awaiting_registration(self) -> bool:
+        """Pushing, but D's PUSH_REG has not arrived yet."""
+        return self.reg is None and self.pushing
 
 
 class NixlPushConnectorWorker(NixlBaseConnectorWorker):
@@ -86,6 +192,11 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
     _TRANSFER_MODE: str = "push"
 
     _supports_pp_hma = True
+
+    # Set from ``chunkwise_push`` in kv_connector_extra_config (P side).
+    chunkwise_push: bool = False
+    # Set from ``push_writer_progress`` in kv_connector_extra_config.
+    _writer_progress: bool = False
 
     def __init__(
         self,
@@ -136,6 +247,51 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         self._push_writer_stop = threading.Event()
         self._push_writer_thread: threading.Thread | None = None
 
+        # P-side: poll the WRITEs' completion on the writer thread (every
+        # poll interval) instead of once per engine step. NIXL's UCX backend
+        # only sends a WRITE's notif when the initiator checks the transfer,
+        # so per-step polling delays D by up to a (long prefill) step.
+        self._writer_progress = bool(
+            self.kv_transfer_config.get_from_extra_config("push_writer_progress", False)
+        )
+        # Writer -> main thread: (done, failed) request ids of the WRITEs.
+        self._sending_results: queue.Queue[tuple[set[str], set[str]]] = queue.Queue()
+
+        # Chunk-wise push (P side), see module docstring.
+        self.chunkwise_push = bool(
+            self.kv_transfer_config.get_from_extra_config("chunkwise_push", False)
+        )
+        if self.chunkwise_push and (
+            reason := chunkwise_push_unsupported_reason(vllm_config, kv_cache_config)
+        ):
+            logger.warning_once("Disabling NIXL chunk-wise push: %s.", reason)
+            self.chunkwise_push = False
+        self._init_chunkwise_state()
+        # Groups indexed by token (attention), as opposed to Mamba state.
+        self._cw_attn_groups = [
+            g for g, t in enumerate(self._group_spec_types) if not _is_ssm_spec(t)
+        ]
+        if self.chunkwise_push:
+            logger.info("NIXL chunk-wise push enabled (rank %d)", self.tp_rank)
+
+    def _init_chunkwise_state(self) -> None:
+        # Main thread -> writer, in step order.
+        self._cw_inbox: queue.Queue[_ChunkTask | _ChunkSignal] = queue.Queue()
+        # Main thread: number of steps whose metadata was bound.
+        self._cw_seq = 0
+        # Main thread -> writer: preempted or aborted requests, until the
+        # writer handled their "fallback" / "drop" message.
+        self._cw_cancelled: set[ReqId] = set()
+        # Writer -> main thread: requests whose final WRITE is in flight.
+        self._cw_final_inflight: set[ReqId] = set()
+        # Writer -> main thread: requests whose chunk-wise push completed.
+        self._cw_done: queue.Queue[ReqId] = queue.Queue()
+        # Main thread: completed pushes awaiting the scheduler's lease, so that
+        # blocks are only released once the request has finished.
+        self._cw_completed: set[ReqId] = set()
+        # Writer-thread owned per-request state.
+        self._cw_writes: dict[ReqId, _ChunkwiseWrite] = {}
+
     # --- Lifecycle ----------------------------------------------------- #
 
     def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]):
@@ -177,8 +333,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         self._push_writer_stop.set()
         # Unblock the writer if it's waiting in the no-active-state branch.
         self._push_writer_wake.set()
+        writer_alive = False
         if self._push_writer_thread is not None:
             self._push_writer_thread.join(timeout=2)
+            writer_alive = self._push_writer_thread.is_alive()
             self._push_writer_thread = None
         with self._sending_transfers_lock:
             for handles in self._sending_transfers.values():
@@ -186,6 +344,12 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     self.nixl_wrapper.release_xfer_handle(handle)
             self._sending_transfers.clear()
             self._send_failures.clear()
+        # The chunk-wise state belongs to the writer: leave it to a stuck one.
+        if not writer_alive:
+            for state in self._cw_writes.values():
+                for handle in state.handles:
+                    self.nixl_wrapper.release_xfer_handle(handle)
+            self._cw_writes.clear()
         super().shutdown()
 
     # --- Engine-main-thread entry point -------------------------------- #
@@ -247,16 +411,98 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     )
                 self._reqs_to_send[req_id] = expiration_time
 
+        if self.chunkwise_push and metadata.push_chunkwise_finished:
+            for req_id, block_ids in metadata.push_chunkwise_finished.items():
+                self._cw_inbox.put(_ChunkSignal(req_id, "finished", blocks=block_ids))
+            self._push_writer_wake.set()
+
         # Heartbeats still leave from the main thread (base worker behaviour).
         self._send_heartbeats(metadata)
+
+    # --- Chunk-wise push (engine main thread) -------------------------- #
+
+    def bind_chunkwise(self, metadata: NixlConnectorMetadata) -> None:
+        """Start of every step, before its forward: cancel the pushes of the
+        requests preempted or aborted since the last step, then count the step.
+
+        A preemption or an abort frees a request's blocks before its lease,
+        and reaches this hook before the forward that may reuse them. The
+        writer posts no WRITE for a cancelled request, and this waits for its
+        final WRITE if in flight (a fence), so D is never notified of KV read
+        from reused blocks. Hence once the step after a request's last chunk
+        was counted without cancelling it, its final WRITE can go out (see
+        _cw_final_due). An earlier WRITE reading reused blocks is harmless: D
+        is not notified, or a whole-request push overwrites it.
+        """
+        preempted = metadata.push_chunkwise_preempted
+        fences: list[tuple[ReqId, threading.Event]] = []
+        for req_id in preempted | metadata.reqs_not_processed:
+            self._cw_cancelled.add(req_id)
+            # After the line above: a final WRITE the writer is about to post
+            # shows up here, or it sees the cancellation (_cw_write_tasks).
+            fence = threading.Event() if req_id in self._cw_final_inflight else None
+            kind = "fallback" if req_id in preempted else "drop"
+            self._cw_inbox.put(_ChunkSignal(req_id, kind, fence=fence))
+            if fence is not None:
+                fences.append((req_id, fence))
+        # After the cancellations: the writer reads the count first.
+        self._cw_seq += 1
+        self._push_writer_wake.set()
+        if (
+            not fences
+            or self._push_writer_thread is None
+            or self._push_writer_stop.is_set()
+        ):
+            return
+        deadline = time.monotonic() + _CHUNKWISE_FENCE_TIMEOUT_S
+        for req_id, fence in fences:
+            if not fence.wait(max(0.0, deadline - time.monotonic())):
+                logger.warning(
+                    "NIXL chunk-wise push: the final WRITE of %s is still in "
+                    "flight after %.0fs; its blocks may be reused while read.",
+                    req_id,
+                    _CHUNKWISE_FENCE_TIMEOUT_S,
+                )
+
+    def wait_for_save(self, metadata: NixlConnectorMetadata) -> None:
+        """End of a step's forward: queue the blocks it completed for WRITE."""
+        if not metadata.push_chunkwise_steps:
+            return
+        # Blocking-sync: a writer sleeping on it doesn't spin.
+        event = torch.cuda.Event(blocking=True)
+        event.record()
+        ratio = self._physical_blocks_per_logical_kv_block
+        for req_id, step in metadata.push_chunkwise_steps.items():
+            self._cw_inbox.put(
+                _ChunkTask(
+                    req_id=req_id,
+                    seq=self._cw_seq,
+                    start=step.start_block * ratio,
+                    kernel_block_ids=self._logical_to_kernel_block_ids(
+                        self._as_grouped_block_ids(step.block_ids), ratio
+                    ),
+                    num_prompt_tokens=step.num_prompt_tokens,
+                    final=step.is_last,
+                    event=event,
+                )
+            )
+        self._push_writer_wake.set()
 
     # --- Writer thread ------------------------------------------------- #
 
     def _push_writer_loop(self) -> None:
         sleep_s = _PUSH_WRITER_POLL_INTERVAL_MS / 1000.0
+        if self.chunkwise_push:
+            # Like the handshake thread: the CUDA event calls must not create
+            # a context on another device.
+            current_platform.set_device(self.device_id)
 
         while not self._push_writer_stop.is_set():
             try:
+                # 0. Chunk-wise tasks and control messages, in order.
+                if self.chunkwise_push:
+                    self._cw_process_inbox()
+
                 # 1. D registrations to send.
                 while True:
                     try:
@@ -296,6 +542,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                         break
                     self._push_finished_blocks.pop(rid, None)
                     self._pending_d_registrations.pop(rid, None)
+                    if self.chunkwise_push:
+                        self._cw_cancel(rid, "drop")
 
                 # 4. NIXL notifs: route PUSH_REG; forward the rest.
                 for notifs in self.nixl_wrapper.get_new_notifs().values():
@@ -304,17 +552,40 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                             self._handle_push_reg_notif(notif)
                         else:
                             self._pending_completion_notifs.put(notif)
+
+                # 5. Chunk-wise WRITEs: completions, then the ready ones.
+                if self.chunkwise_push:
+                    self._cw_progress()
+
+                # 6. Whole-request WRITE completions.
+                if self._writer_progress and self._sending_transfers:
+                    self._poll_sending_transfers()
             except Exception:
                 logger.exception("nixl-push-writer error; continuing")
 
-            # Self-poll only while there is no other wake source: P-side
-            # finished blocks waiting for a D PUSH_REG match. All other
-            # progress is event-driven (see module docstring).
-            if self._push_finished_blocks:
+            # Self-poll only while something has no other wake source (see
+            # module docstring).
+            if (
+                self._push_finished_blocks
+                or (self._writer_progress and self._sending_transfers)
+                or (self.chunkwise_push and self._cw_needs_poll())
+            ):
                 self._push_writer_stop.wait(timeout=sleep_s)
+            elif self.chunkwise_push and (event := self._cw_next_event()):
+                # Nothing to do before this step is computed: sleep on it
+                # rather than poll (GIL / CUDA driver contention).
+                event.synchronize()
             else:
                 self._push_writer_wake.wait()
                 self._push_writer_wake.clear()
+
+    def _poll_sending_transfers(self) -> None:
+        """Writer-side WRITE polling (``push_writer_progress``); results go
+        to the engine thread's ``get_transfer_results``."""
+        with self._sending_transfers_lock:
+            done, failed = self._pop_done_transfers(self._sending_transfers)
+        if done or failed:
+            self._sending_results.put((done, failed))
 
     def _handle_push_reg_notif(self, notif: bytes) -> None:
         try:
@@ -326,13 +597,459 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         if not isinstance(rid, str):
             logger.warning("PUSH_REG notif missing request_id; dropping")
             return
+        self._route_push_registration(reg_data)
 
+    def _route_push_registration(self, reg_data: dict[str, Any]) -> None:
+        """Match a D registration with finished P blocks or a chunk-wise push,
+        or keep it until one of them shows up."""
+        rid = reg_data["request_id"]
         match = self._pop_matching_finished_blocks(rid)
         if match is not None:
             fin_id, blocks = match
             self._do_start_push_kv(fin_id, blocks, reg_data)
+        elif self.chunkwise_push and (
+            (cw_id := self._cw_match_unregistered(rid)) is not None
+        ):
+            state = self._cw_writes[cw_id]
+            with self._cw_guard(cw_id, state):
+                self._cw_attach(cw_id, state, reg_data)
         else:
             self._pending_d_registrations[rid] = reg_data
+
+    # --- Chunk-wise push (writer thread) ------------------------------- #
+
+    @contextlib.contextmanager
+    def _cw_guard(self, req_id: str, state: _ChunkwiseWrite) -> Iterator[None]:
+        """Fail one request's chunk-wise push on error: D is never notified of
+        a partial push, and the other requests go on."""
+        try:
+            yield
+        except Exception as e:
+            self._log_failure(
+                failure_type="chunkwise_push_failed", req_id=req_id, error=e
+            )
+            self._cw_fail(state)
+
+    def _cw_process_inbox(self) -> None:
+        """Queue the steps' tasks and apply the control messages, in order."""
+        while True:
+            try:
+                item = self._cw_inbox.get_nowait()
+            except queue.Empty:
+                return
+            if isinstance(item, _ChunkTask):
+                self._cw_handle_task(item)
+            elif item.kind in ("drop", "fallback"):
+                self._cw_cancel(item.req_id, item.kind, item.fence)
+            elif (state := self._cw_writes.get(item.req_id)) is None:
+                continue
+            elif item.kind == "finished":
+                state.finished_blocks = item.blocks
+                if state.monolithic and state.pushing:
+                    self._cw_push_whole(item.req_id, state)
+            elif item.error is not None:
+                self._log_failure(
+                    failure_type="push_handshake_failed",
+                    req_id=item.req_id,
+                    error=item.error,
+                )
+                self._cw_fail(state)
+            else:
+                self._cw_prepare(item.req_id, state)
+
+    def _cw_handle_task(self, task: _ChunkTask) -> None:
+        state = self._cw_writes.get(task.req_id)
+        if state is None:
+            state = self._cw_writes[task.req_id] = _ChunkwiseWrite(
+                num_prompt_tokens=task.num_prompt_tokens
+            )
+            if (reg := self._pop_matching_registration(task.req_id)) is not None:
+                with self._cw_guard(task.req_id, state):
+                    self._cw_attach(task.req_id, state, reg)
+        if state.pushing and not state.monolithic:
+            # WRITTEN by _cw_progress once D is ready and the step computed.
+            state.pending.append(task)
+
+    def _cw_match_unregistered(self, request_id: str) -> str | None:
+        """P request id of a chunk-wise push still waiting for *request_id*'s
+        registration."""
+        return match_request_id(
+            request_id,
+            [
+                req_id
+                for req_id, state in self._cw_writes.items()
+                if state.awaiting_registration
+            ],
+        )
+
+    def _cw_attach(self, req_id: str, state: _ChunkwiseWrite, reg: dict) -> None:
+        """Pair a D registration with a chunk-wise push; handshake if needed."""
+        state.reg = reg
+        fut = self._ensure_handshake(
+            reg["decode_engine_id"],
+            reg["decode_host"],
+            reg["decode_port"],
+            reg["decode_tp_size"],
+        )
+        if fut is None:
+            self._cw_prepare(req_id, state)
+            return
+
+        def _on_handshake(f: Future, rid: str = req_id) -> None:
+            self._cw_inbox.put(_ChunkSignal(rid, "ready", f.exception()))
+            self._push_writer_wake.set()
+
+        fut.add_done_callback(_on_handshake)
+
+    def _cw_prepare(self, req_id: str, state: _ChunkwiseWrite) -> None:
+        """Resolve the WRITE geometry once D registered and is handshaked;
+        _cw_progress then WRITEs the tasks.
+
+        Chunk-wise WRITEs pair blocks by position. A D of other geometry gets
+        the whole request in one WRITE once it finished instead.
+        """
+        if not state.pushing:
+            return
+        with self._cw_guard(req_id, state):
+            assert self.transfer_topo is not None and state.reg is not None
+            reg = state.reg
+            engine_id = reg["decode_engine_id"]
+            info = self.transfer_topo.get_engine_info(engine_id)
+            plan = self.tp_mappings[engine_id]
+            remote_block_ids = self._logical_to_kernel_block_ids(
+                self._as_grouped_block_ids(reg["local_block_ids"]),
+                info.remote_physical_blocks_per_logical,
+            )
+            ratio = self._physical_blocks_per_logical_kv_block
+            num_local = cdiv(state.num_prompt_tokens, self.block_size * ratio) * ratio
+            num_remote = max(
+                (len(remote_block_ids[g]) for g in self._cw_attn_groups), default=0
+            )
+            self._engine_last_active[engine_id] = time.perf_counter()
+            state.ready = True
+            if reason := self._cw_geometry_mismatch(
+                engine_id, info, plan, remote_block_ids
+            ):
+                logger.warning_once(
+                    "NIXL chunk-wise push: requests to %s are pushed whole once "
+                    "they finished (%s).",
+                    engine_id,
+                    reason,
+                )
+                self._cw_go_whole(req_id, state)
+                return
+            if num_remote > num_local:
+                logger.debug(
+                    "NIXL chunk-wise push: %s is pushed whole, D allocated %d "
+                    "blocks for %d prompt blocks.",
+                    req_id,
+                    num_remote,
+                    num_local,
+                )
+                self._cw_go_whole(req_id, state)
+                return
+            rank = plan.all_source_ranks[0]
+            with self._handshake_lock:
+                state.remote_agent = self._remote_agents[engine_id][(0, rank)]
+            state.dst_engine_id = engine_id
+            state.local_handle = self.src_xfer_handles_by_block_size[self.block_size]
+            state.remote_handle = self.dst_xfer_side_handles[engine_id][rank]
+            state.remote_physical_per_logical = info.remote_physical_blocks_per_logical
+            state.notif = f"{reg['request_id']}:{self.world_size}".encode()
+            state.remote_block_ids = remote_block_ids
+            state.fa_offset = num_local - num_remote
+
+    def _cw_geometry_mismatch(
+        self, engine_id: str, info: Any, plan: Any, remote_block_ids: BlockIds
+    ) -> str | None:
+        """Why blocks can't be WRITTEN to *engine_id* by position, if so."""
+        assert self.transfer_topo is not None
+        if (tp_ratio := self.transfer_topo.tp_ratio(info.remote_tp_size)) != 1:
+            return f"TP ratio {tp_ratio}"
+        if info.remote_block_size != self.block_size:
+            return f"block size {info.remote_block_size} vs {self.block_size}"
+        ratio = self._physical_blocks_per_logical_kv_block
+        if info.remote_physical_blocks_per_logical != ratio:
+            return (
+                f"{info.remote_physical_blocks_per_logical} kernel blocks per "
+                f"block vs {ratio}"
+            )
+        if len(plan.all_source_ranks) != 1:
+            return f"{len(plan.all_source_ranks)} source ranks"
+        if not self._dst_pairs[engine_id].groups_match:
+            return "different cache group layout"
+        if len(remote_block_ids) != len(self._group_spec_types):
+            return f"{len(remote_block_ids)} cache groups"
+        return None
+
+    def _cw_go_whole(self, req_id: str, state: _ChunkwiseWrite) -> None:
+        state.monolithic = True
+        state.pending.clear()
+        if state.finished_blocks is not None:
+            self._cw_push_whole(req_id, state)
+
+    def _cw_push_whole(self, req_id: str, state: _ChunkwiseWrite) -> None:
+        """Push a finished request whole, like a request without chunk-wise
+        push: the scheduler's block table, under the request's lease."""
+        assert state.reg is not None and state.finished_blocks is not None
+        del self._cw_writes[req_id]
+        self._do_start_push_kv(req_id, state.finished_blocks, state.reg)
+
+    def _cw_final_due(self, task: _ChunkTask) -> bool:
+        """The next step's metadata was bound: had it cancelled the request,
+        _cw_write_tasks sees it (read after the step count, see
+        bind_chunkwise)."""
+        return self._cw_seq > task.seq
+
+    def _cw_post_ready(self, req_id: str, state: _ChunkwiseWrite) -> None:
+        """WRITE the queued tasks whose step is computed, in one WRITE. The
+        final one, with D's notif, waits until it is due and the request's
+        earlier WRITEs are done, so the notif implies all of the KV landed."""
+        ready: list[_ChunkTask] = []
+        for task in state.pending:
+            if not task.event.query():
+                break
+            ready.append(task)
+        if not ready:
+            return
+        notif = b""
+        if ready[-1].final:
+            if not state.handles and self._cw_final_due(ready[-1]):
+                notif = state.notif
+            else:
+                ready.pop()
+        if ready and self._cw_write_tasks(req_id, state, ready, notif=notif):
+            for _ in ready:
+                state.pending.popleft()
+            if notif:
+                state.final_posted = True
+
+    def _cw_write_tasks(
+        self,
+        req_id: str,
+        state: _ChunkwiseWrite,
+        tasks: list[_ChunkTask],
+        notif: bytes = b"",
+    ) -> bool:
+        """One WRITE of *tasks*' blocks, with D's *notif* for the final one
+        (just the notif if nothing is left to write). Returns whether it was
+        posted."""
+        desc_ids = [ids for task in tasks if (ids := self._cw_desc_ids(state, task))]
+        if notif:
+            # Before the cancellation check, see bind_chunkwise.
+            self._cw_final_inflight.add(req_id)
+        try:
+            if self._push_writer_stop.is_set() or req_id in self._cw_cancelled:
+                return False
+            if desc_ids:
+                return self._cw_write(
+                    req_id,
+                    state,
+                    np.concatenate([local for local, _ in desc_ids]),
+                    np.concatenate([remote for _, remote in desc_ids]),
+                    notif=notif,
+                )
+            if notif:
+                try:
+                    self.nixl_wrapper.send_notif(state.remote_agent, notif_msg=notif)
+                except Exception as e:
+                    self._log_failure(
+                        failure_type="notification_failed", req_id=req_id, error=e
+                    )
+                    self.xfer_stats.record_failed_notification()
+                    self._cw_fail(state)
+                    return False
+            return True
+        finally:
+            if not state.handles:
+                self._cw_final_inflight.discard(req_id)
+
+    def _cw_desc_ids(
+        self, state: _ChunkwiseWrite, task: _ChunkTask
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Local/remote descriptor ids of the blocks *task* WRITEs."""
+        offset = state.fa_offset
+        ssm = [_is_ssm_spec(spec_type) for spec_type in self._group_spec_types]
+        local_ids: list[list[int]] = []
+        remote_ids: list[list[int]] = []
+        for g, is_ssm in enumerate(ssm):
+            if is_ssm:
+                local_ids.append([])
+                remote_ids.append([])
+                continue
+            # D allocated only the suffix it has not cached.
+            local = task.kernel_block_ids[g]
+            remote = state.remote_block_ids[g]
+            lo = max(task.start, offset)
+            hi = max(lo, task.start + len(local))
+            local_ids.append(list(local[lo - task.start : hi - task.start]))
+            remote_ids.append(list(remote[lo - offset : hi - offset]))
+        if task.final and any(ssm):
+            # Pair the Mamba state slots like a whole-request WRITE does.
+            remote_ssm, local_ssm = self._apply_prefix_caching(
+                decode_block_ids=[
+                    list(blocks) if is_ssm else []
+                    for blocks, is_ssm in zip(state.remote_block_ids, ssm)
+                ],
+                prefill_block_ids=[
+                    list(blocks) if is_ssm else []
+                    for blocks, is_ssm in zip(task.kernel_block_ids, ssm)
+                ],
+                decode_physical_per_logical=state.remote_physical_per_logical,
+                prefill_physical_per_logical=self._physical_blocks_per_logical_kv_block,
+            )
+            for g, is_ssm in enumerate(ssm):
+                if is_ssm:
+                    local_ids[g] = list(local_ssm[g])
+                    remote_ids[g] = list(remote_ssm[g])
+        for g, (local, remote) in enumerate(zip(local_ids, remote_ids)):
+            if len(local) != len(remote):
+                raise ValueError(
+                    f"chunk-wise push block mismatch for {task.req_id} group {g}: "
+                    f"{len(local)} local vs {len(remote)} remote blocks"
+                )
+        if not any(local_ids):
+            return None
+        # Same block size as D (see _cw_geometry_mismatch).
+        return self._write_desc_ids(
+            local_ids,
+            remote_ids,
+            state.dst_engine_id,
+            remote_physical_per_logical=state.remote_physical_per_logical,
+            block_size_ratio=1,
+        )
+
+    def _cw_write(
+        self,
+        req_id: str,
+        state: _ChunkwiseWrite,
+        local_descs: np.ndarray,
+        remote_descs: np.ndarray,
+        notif: bytes = b"",
+    ) -> bool:
+        handle = None
+        try:
+            handle = self.nixl_wrapper.make_prepped_xfer(
+                "WRITE",
+                state.local_handle,
+                local_descs,
+                state.remote_handle,
+                remote_descs,
+                notif_msg=notif,
+            )
+            self.nixl_wrapper.transfer(handle)
+        except Exception as e:
+            self._log_failure(
+                failure_type="transfer_setup_failed",
+                req_id=req_id,
+                msg="Chunk-wise push WRITE submission failed",
+                error=e,
+                dst_engine_id=state.dst_engine_id,
+            )
+            self._cw_fail(state)
+            if not self._handle_failed_transfer(req_id, handle):
+                # Only a submitted transfer can need retaining.
+                assert handle is not None
+                state.handles.append(handle)
+            return False
+        state.handles.append(handle)
+        return True
+
+    def _cw_fail(self, state: _ChunkwiseWrite) -> None:
+        """Stop pushing; D is not notified and P frees the blocks when the
+        lease expires (same as a failed whole-request push). The state stays
+        until dropped, to absorb the request's later tasks."""
+        state.failed = True
+        state.pending.clear()
+
+    def _cw_cancel(
+        self, req_id: str, kind: str, fence: threading.Event | None = None
+    ) -> None:
+        """Stop a request's chunk-wise push: it was preempted ("fallback": it
+        is pushed whole once it finished), or aborted or its lease is gone
+        ("drop"). Its state goes once its WRITEs are done, which is when
+        *fence* is set (see bind_chunkwise)."""
+        self._cw_cancelled.discard(req_id)
+        state = self._cw_writes.get(req_id)
+        if state is None:
+            if fence is not None:
+                fence.set()
+            return
+        if state.cancelled != "drop":
+            state.cancelled = kind
+        state.pending.clear()
+        if fence is not None:
+            state.fences.append(fence)
+
+    def _cw_progress(self) -> None:
+        """Poll the in-flight WRITEs (the UCX backend only progresses a
+        transfer, and sends its notif, when it is checked), WRITE the tasks
+        that are ready and retire the requests that are done. Never blocks."""
+        in_flight = {
+            req_id: state.handles
+            for req_id, state in self._cw_writes.items()
+            if state.handles
+        }
+        if in_flight:
+            _, failed = self._pop_done_transfers(in_flight)
+            for req_id, state in self._cw_writes.items():
+                if state.handles:
+                    state.handles = in_flight.get(req_id, [])
+                if req_id in failed:
+                    self._cw_fail(state)
+        for req_id, state in self._cw_writes.items():
+            if not state.handles:
+                self._cw_final_inflight.discard(req_id)
+            if state.ready and state.pushing and not state.monolithic:
+                with self._cw_guard(req_id, state):
+                    self._cw_post_ready(req_id, state)
+        self._cw_retire()
+
+    def _cw_retire(self) -> None:
+        """Once their WRITEs are done: report the completed pushes, release
+        the fences of the cancelled ones and hand a preempted request's
+        registration to its whole-request push."""
+        for req_id, state in list(self._cw_writes.items()):
+            if state.handles:
+                continue
+            if state.cancelled is None:
+                if state.final_posted and not state.failed:
+                    del self._cw_writes[req_id]
+                    self._cw_done.put(req_id)
+                continue
+            del self._cw_writes[req_id]
+            for fence in state.fences:
+                fence.set()
+            if state.cancelled == "drop" or state.reg is None:
+                continue
+            if state.final_posted:
+                # D was notified: a second push could overwrite blocks it uses.
+                logger.warning(
+                    "NIXL chunk-wise push: %s was preempted after its push; "
+                    "not pushing it again.",
+                    req_id,
+                )
+            else:
+                self._route_push_registration(state.reg)
+
+    def _cw_needs_poll(self) -> bool:
+        """In-flight WRITEs to check, or a PUSH_REG to wait for: progress only
+        polling reveals."""
+        return any(
+            state.handles or state.awaiting_registration
+            for state in self._cw_writes.values()
+        )
+
+    def _cw_next_event(self) -> "torch.cuda.Event | None":
+        """The event of the oldest step a WRITE waits for, if any."""
+        oldest: _ChunkTask | None = None
+        for state in self._cw_writes.values():
+            if not (state.ready and state.pushing and state.pending):
+                continue
+            task = state.pending[0]
+            if (oldest is None or task.seq < oldest.seq) and not task.event.query():
+                oldest = task
+        return None if oldest is None else oldest.event
 
     # --- D-side registration send (writer thread) ---------------------- #
 
@@ -423,14 +1140,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         Exact key first, then a match after stripping the random suffix from
         both sides. No match leaves the request unmatched (push not started).
         """
-        data = self._pending_d_registrations.pop(request_id, None)
-        if data is not None:
-            return data
-        base_id = get_base_request_id(request_id)
-        for reg_id in list(self._pending_d_registrations):
-            if get_base_request_id(reg_id) == base_id:
-                return self._pending_d_registrations.pop(reg_id)
-        return None
+        reg_id = match_request_id(request_id, self._pending_d_registrations)
+        if reg_id is None:
+            return None
+        return self._pending_d_registrations.pop(reg_id)
 
     def _pop_matching_finished_blocks(
         self, request_id: str
@@ -440,14 +1153,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         Same lookup as ``_pop_matching_registration``: exact key, then a
         match after stripping the random suffix from both sides.
         """
-        blocks = self._push_finished_blocks.pop(request_id, None)
-        if blocks is not None:
-            return request_id, blocks
-        base_id = get_base_request_id(request_id)
-        for fin_id in list(self._push_finished_blocks):
-            if get_base_request_id(fin_id) == base_id:
-                return fin_id, self._push_finished_blocks.pop(fin_id)
-        return None
+        fin_id = match_request_id(request_id, self._push_finished_blocks)
+        if fin_id is None:
+            return None
+        return fin_id, self._push_finished_blocks.pop(fin_id)
 
     # --- WRITE transfer logic (writer thread) ------------------------- #
 
@@ -647,6 +1356,39 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             with self._sending_transfers_lock:
                 self._sending_transfers[req_id].extend(handles)
 
+    def _write_desc_ids(
+        self,
+        local_block_ids: BlockIds,
+        remote_block_ids: BlockIds,
+        dst_engine_id: str,
+        remote_physical_per_logical: int,
+        block_size_ratio: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Local / remote descriptor ids of a WRITE of the kernel blocks
+        *local_block_ids* into *remote_block_ids*, paired by position. Pair k
+        writes local region pairs.local[k] into remote region pairs.remote[k]
+        at its cache group's blocks."""
+        pairs = self._dst_pairs[dst_engine_id]
+        local_descs = self._compute_desc_ids(
+            block_ids=local_block_ids,
+            dst_num_blocks=self.dst_num_blocks[self.engine_id],
+            block_size_ratio=block_size_ratio,
+            physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
+            region_num_blocks=self.dst_region_num_blocks[self.engine_id],
+            pairs=(pairs.local, pairs.group),
+        )
+        remote_descs = self._compute_desc_ids(
+            block_ids=remote_block_ids,
+            dst_num_blocks=self.dst_num_blocks[dst_engine_id],
+            block_size_ratio=None,
+            physical_blocks_per_logical=remote_physical_per_logical,
+            region_num_blocks=self.dst_region_num_blocks[dst_engine_id],
+            pairs=(pairs.remote, pairs.group),
+            ssm_regions=pairs.remote_ssm_regions,
+        )
+        assert len(local_descs) == len(remote_descs)
+        return local_descs, remote_descs
+
     def _xfer_blocks(
         self,
         read_spec: ReadSpec,
@@ -706,28 +1448,13 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 f"{len(remote_block_ids[i])} remote blocks"
             )
 
-        # Get descs ids. Pair k writes local region pairs.local[k] into remote
-        # region pairs.remote[k] at its cache group's blocks.
-        pairs = self._dst_pairs[dst_engine_id]
-        remote_block_descs_ids = self._compute_desc_ids(
-            block_ids=remote_block_ids,
-            dst_num_blocks=self.dst_num_blocks[dst_engine_id],
-            block_size_ratio=None,
-            physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
-            region_num_blocks=self.dst_region_num_blocks[dst_engine_id],
-            pairs=(pairs.remote, pairs.group),
-            ssm_regions=pairs.remote_ssm_regions,
-        )
-        local_block_descs_ids = self._compute_desc_ids(
-            block_ids=local_block_ids,
-            dst_num_blocks=self.dst_num_blocks[self.engine_id],
+        local_block_descs_ids, remote_block_descs_ids = self._write_desc_ids(
+            local_block_ids,
+            remote_block_ids,
+            dst_engine_id,
+            remote_physical_per_logical=remote_info.remote_physical_blocks_per_logical,
             block_size_ratio=block_size_ratio,
-            physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
-            region_num_blocks=self.dst_region_num_blocks[self.engine_id],
-            pairs=(pairs.local, pairs.group),
         )
-
-        assert len(local_block_descs_ids) == len(remote_block_descs_ids)
 
         handle = None
         try:
@@ -761,6 +1488,21 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             if not self._handle_failed_transfer(request_id, handle):
                 return handle
             return None
+
+    def _pop_chunkwise_done(self) -> set[str]:
+        """Chunk-wise pushes to report as sent. A push usually completes
+        before the scheduler finished its request, so it is only reported once
+        the request's lease (sent on finish) has reached this worker."""
+        while True:
+            try:
+                self._cw_completed.add(self._cw_done.get_nowait())
+            except queue.Empty:
+                break
+        # Expired leases were already reported; aborted requests get none.
+        self._cw_completed &= self._reqs_to_process
+        done = {req_id for req_id in self._cw_completed if req_id in self._reqs_to_send}
+        self._cw_completed -= done
+        return done
 
     # --- Notification handling on engine main thread ------------------ #
 
@@ -818,9 +1560,19 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # ``_pop_done_transfers`` mutates ``_sending_transfers``; the
         # writer thread also appends to it, so guard the pop.
         with self._sending_transfers_lock:
-            done_pushing, failed_pushing = self._pop_done_transfers(
-                self._sending_transfers
-            )
+            if self._writer_progress:
+                done_pushing, failed_pushing = set(), set()
+                while True:
+                    try:
+                        done, failed = self._sending_results.get_nowait()
+                    except queue.Empty:
+                        break
+                    done_pushing |= done
+                    failed_pushing |= failed
+            else:
+                done_pushing, failed_pushing = self._pop_done_transfers(
+                    self._sending_transfers
+                )
             # Remember failures until the final sibling WRITE completes.
             self._send_failures.update(failed_pushing)
             successful = {
@@ -831,6 +1583,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             self._send_failures.difference_update(done_pushing | done_sending)
         # Expired requests were already reported, even if their WRITEs finish later.
         done_pushing = successful
+        if self.chunkwise_push:
+            done_pushing |= self._pop_chunkwise_done()
         for req_id in done_pushing:
             self._reqs_to_send.pop(req_id, None)
             self._reqs_to_process.discard(req_id)

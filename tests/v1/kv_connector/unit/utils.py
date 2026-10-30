@@ -604,6 +604,7 @@ def make_nixl_push_scheduler(
     push_registration_timeout: float | None = None,
     is_bidirectional_kv_xfer_enabled: bool = False,
     has_mamba: bool = False,
+    block_size: int = 16,
 ):
     """Create a NixlPushConnectorScheduler via __new__ (skipping __init__).
 
@@ -616,6 +617,9 @@ def make_nixl_push_scheduler(
 
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_scheduler import (
         NixlPushConnectorScheduler,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+        transfer_block_size,
     )
 
     sched = object.__new__(NixlPushConnectorScheduler)
@@ -637,7 +641,7 @@ def make_nixl_push_scheduler(
     sched._has_mamba = has_mamba
     sched._bounded_replay = False
     sched.kv_cache_config = make_kv_cache_config(
-        block_size=16,
+        block_size=block_size,
         mamba_enabled=has_mamba,
     )
 
@@ -658,6 +662,11 @@ def make_nixl_push_scheduler(
         if push_registration_timeout is not None
         else decoder_kv_blocks_ttl
     )
+    sched._chunkwise_push = False
+    sched._cw_reqs = {}
+    sched._cw_finished_blocks = {}
+    sched._cw_block_size = transfer_block_size(sched.kv_cache_config, block_size)
+    sched._ssm_spec_blocks = [None, 0] if has_mamba else [None]
 
     # Heartbeat fields touched by base request_finished /
     # update_connector_output.

@@ -97,14 +97,15 @@ existing base-worker ``_send_heartbeats`` plumbing inside
 ### Wake model
 
 The writer thread blocks on ``_push_writer_wake`` (a
-``threading.Event``) when it has no work. Three callers set the
+``threading.Event``) when it has no work. These callers set the
 event:
 
 1. **``start_load_kv``** (worker main thread, called once per engine
    step with the scheduler's metadata) — sets the wake only when the
    step actually hands the writer new work, i.e. when
-   ``meta.push_registrations`` or ``meta.push_finished_blocks`` is
-   non-empty. This is the wake for new transfers.
+   ``meta.push_registrations``, ``meta.push_finished_blocks`` or
+   ``meta.push_chunkwise_finished`` is non-empty. This is the wake for
+   new transfers.
 2. **``get_finished``** (worker main thread, called once per engine
    step to report completions) — always sets the wake. The writer is
    the sole consumer of ``nixl_wrapper.get_new_notifs()`` for push,
@@ -119,22 +120,45 @@ event:
     * the **D→P** handshake (before sending ``PUSH_REG``) re-enqueues the
       registration onto ``_reg_send_inbox``;
     * the **P→D** handshake (before a WRITE) re-enqueues the matched
-      ``(req_id, blocks, reg_data)`` onto ``_deferred_push_inbox``.
+      ``(req_id, blocks, reg_data)`` onto ``_deferred_push_inbox``;
+    * the **P→D** handshake of a chunk-wise push queues a ``"ready"``
+      message onto ``_cw_inbox``, with the error if it failed.
 
    On this second pass ``_ensure_handshake`` returns ``None`` (the agent
    is now connected), so the writer sends the ``PUSH_REG`` / issues the
    WRITE directly. If a handshake *failed*, the callback fails or drops
-   the request instead of re-enqueuing, so there is no retry loop (see
+   the request instead of re-enqueuing (a chunk-wise push is failed by
+   the writer on its ``"ready"``), so there is no retry loop (see
    Failure handling).
+4. **Chunk-wise push** (worker main thread) — ``bind_chunkwise`` at the
+   start of every step, and ``wait_for_save`` when a step's forward
+   queued chunk-wise tasks.
 
 In addition to event-driven wakes, the writer self-polls at
 ``_PUSH_WRITER_POLL_INTERVAL_MS = 1.0`` ms while there are P-side
-finished blocks waiting for an unmatched ``PUSH_REG``.
+finished blocks waiting for an unmatched ``PUSH_REG``, whole-request
+WRITEs in flight under ``push_writer_progress``, or chunk-wise pushes
+with WRITEs in flight or waiting for their ``PUSH_REG``. When all that
+is left are chunk-wise WRITEs of a step still being computed, it blocks
+on that step's CUDA event instead (a blocking-sync event: it sleeps
+rather than spins); work handed to it meanwhile waits until the step is
+computed.
 
 When a request completes on P (lease expires or the WRITE finishes),
 ``get_finished`` enqueues the request id onto ``_evict_finished_inbox``,
 which the writer drains to drop stale ``_push_finished_blocks`` /
 ``_pending_d_registrations`` and stop self-polling.
+
+### Writer-side WRITE progress
+
+NIXL's UCX backend sends a WRITE's completion notif only when the initiator
+checks the transfer (``check_xfer_state``). By default P checks its WRITEs once
+per engine step, from ``get_finished``, so while P runs a long prefill step D
+waits for KV that has already landed. With
+``"push_writer_progress": true`` in ``kv_connector_extra_config`` the writer
+polls the in-flight WRITEs every ``_PUSH_WRITER_POLL_INTERVAL_MS`` instead and
+hands the results to ``get_finished`` through ``_sending_results``.
+Chunk-wise WRITEs (below) are always polled by the writer.
 
 ## Writer-local matching tables
 
@@ -156,7 +180,8 @@ appends per engine. Stripping just that suffix normalizes both sides
 to the same id while preserving the completion index (so multi-prompt
 sub-requests stay distinct). It also works whether or not
 ``VLLM_DISABLE_REQUEST_ID_RANDOMIZATION`` is set, which matters since
-that env var is slated for removal upstream.
+that env var is slated for removal upstream. Chunk-wise pushes waiting
+for their ``PUSH_REG`` match the same way (``match_request_id``).
 
 ## Wire format
 
@@ -324,7 +349,12 @@ Two per-request timers are armed on the scheduler:
   ``_handle_failed_transfer`` (there is no ``_recving_metadata`` entry to
   invalidate on the producer side, same reasoning as the WRITE-submission
   failure below). P's blocks are reclaimed by the ``_kv_lease_duration``
-  lease and D's stale registration by its watchdog.
+  lease and D's stale registration by its watchdog. For a chunk-wise
+  push the callback queues the failure, and the writer fails the push.
+* **P-side chunk-wise WRITE failure** (submission or completion) — the
+  push is failed: no further WRITE goes out, in particular not the final
+  one carrying D's completion notif, so D never takes a partial push for
+  a complete one. P's blocks are reclaimed by the lease.
 * **P-side WRITE submission failure** — the WRITE handle (if any) is
   released and ``xfer_stats.record_failed_transfer()`` bumps the
   failure counter. We deliberately do not call
@@ -335,6 +365,74 @@ Two per-request timers are armed on the scheduler:
   outbound WRITE is dropped on the floor; D's lease watchdog handles
   the missing completion.
 
+## Chunk-wise push
+
+By default P WRITEs a request's KV once, after its prefill finished and the
+scheduler released it. With chunk-wise push, P WRITEs the KV of each prefill
+chunk (scheduler step) right after the step computed it, while the next chunks
+are computed. When the prefill ends only the last chunk's KV is left to send.
+Enable it on the prefill instance only:
+
+```json
+{"kv_connector": "NixlPushConnector", "kv_role": "kv_producer",
+ "kv_connector_extra_config": {"chunkwise_push": true}}
+```
+
+D needs no change. The overlap only happens when D registers its blocks before
+or during the prefill, i.e. with a proxy that sends the P and D legs
+concurrently (as `disagg_proxy_pushconnector_demo.py` does). It applies to the
+requests that finish with their prefill (`max_tokens=1`, as P legs are sent);
+the others are pushed whole.
+
+* **Scheduler.** Every step, `build_connector_meta` ships in
+  `meta.push_chunkwise_steps` the attention blocks each such request's prefill
+  completes in that step (a partially filled block waits for the step that
+  fills it); the last chunk ships the rest of the prompt's blocks, without the
+  lookahead slots of speculative decoding, and the Mamba state. Block positions
+  are in units of the transfer block size the workers use
+  (`transfer_block_size`). Such requests skip the post-prefill WRITE; their
+  block table still goes to the workers once they finished
+  (`meta.push_chunkwise_finished`), for a D of other geometry (see below).
+* **Worker.** Every step's metadata is bound before its forward
+  (`bind_chunkwise`). At the end of the forward, `wait_for_save` records a CUDA
+  event and queues one `_ChunkTask` per request on `_cw_inbox`. Descriptor ids
+  are the ones of a whole-request WRITE of the task's blocks, across every
+  layer, and Mamba state slots pair like in a whole-request WRITE.
+* **Writer.** Tasks queue up until D's `PUSH_REG` is matched and the P->D
+  handshake is done. The writer then WRITEs the queued tasks whose event fired,
+  in one WRITE. It checks the events without blocking, so the WRITE of chunk i
+  overlaps with the compute of the following chunks, and a step being computed
+  never holds back other WRITEs. The request's last WRITE carries the
+  completion notif. It is only posted once all earlier WRITEs of the request
+  finished, so the notif implies all KV has landed on D, and once the next
+  step's metadata was bound without cancelling the request. D's completion
+  accounting is unchanged.
+* **Preemption and abort.** A preempted or aborted request's blocks are freed
+  before its lease. `bind_chunkwise` cancels its push before the forward that
+  may reuse them: the scheduler reports preempted requests in
+  `meta.push_chunkwise_preempted` (also a request listed as new again, e.g. a
+  resumed streaming session), and aborted ones in `meta.reqs_not_processed`.
+  Under async scheduling an abort reaches the worker one step late, possibly
+  after the final WRITE went out; `bind_chunkwise` then waits for that WRITE (a
+  fence), so D is never notified of KV read from reused blocks. A preempted
+  request is pushed as a whole when it finishes. D's registration is handed to
+  that push once the cancelled push's WRITEs are done, so the whole-request
+  WRITE overwrites any chunk read from a reused block.
+* **Completion on P.** A push usually completes before the scheduler finished
+  the request. The worker only reports it in `finished_sending` once the
+  request's lease (sent when the scheduler finishes it) reached the worker, so
+  blocks are never released under a running request.
+
+Chunk-wise WRITEs pair P and D blocks by position. If D's TP size, block size,
+kernel-block ratio, source ranks or cache group layout differs from P's, the
+request is pushed as a whole once it finished instead, like a request without
+chunk-wise push (the scheduler's block table, under the lease); a warning is
+logged once per D and reason. Chunk-wise push is disabled (with a warning) with
+pipeline or context parallelism, host-buffer transfer,
+`kv_load_failure_policy=recompute` (a request recomputed in place would leave
+its pushed chunks stale), cache groups other than full attention, MLA and Mamba
+(e.g. sliding window), and attention groups of different block sizes.
+
 ## Summary
 
 The push design is a small, well-contained extension on top of the
@@ -343,13 +441,18 @@ existing NIXL connector:
 * one new connector class, one new scheduler class, one new worker
   class — all subclasses of the existing base classes;
 * one dedicated background thread per worker;
-* a few cross-thread queues, each with a single consumer (the writer);
-  most have one producer, except the two replay queues fed by both the
-  engine main thread and a handshake-completion callback:
-  ``_reg_send_inbox`` (registrations replayed after their D→P handshake)
-  and ``_deferred_push_inbox`` (matched pushes replayed after their P→D
-  handshake);
+* a few cross-thread queues, each with a single consumer: the writer, or
+  the engine main thread for the writer's results
+  (``_pending_completion_notifs``, ``_sending_results``, ``_cw_done``);
+  most have one producer, except the replay queues fed by both the engine
+  main thread and a handshake-completion callback: ``_reg_send_inbox``
+  (registrations replayed after their D→P handshake),
+  ``_deferred_push_inbox`` (matched pushes replayed after their P→D
+  handshake) and, with chunk-wise push, ``_cw_inbox`` (its handshake's
+  ``"ready"``);
 * one new notification type (`PUSH_REG:<msgpack>`).
 
-Behavior on the engine main thread is otherwise unchanged. The writer
-thread is event-driven and idle when there is no push work.
+Behavior on the engine main thread is otherwise unchanged, except that with
+chunk-wise push `bind_chunkwise` may wait for a cancelled request's final WRITE
+before a forward. The writer thread is event-driven and idle when there is no
+push work.

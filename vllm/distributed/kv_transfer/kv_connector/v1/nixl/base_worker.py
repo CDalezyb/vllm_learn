@@ -61,6 +61,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
     get_representative_spec_type,
+    transfer_block_size,
     zmq_ctx,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
@@ -695,16 +696,8 @@ class NixlBaseConnectorWorker:
         )
 
         self.kv_cache_config = kv_cache_config
-        transfer_block_sizes = [
-            group.kv_cache_spec.block_size
-            for group in kv_cache_config.transfer_groups
-            if get_representative_spec_type(group.kv_cache_spec)
-            not in (MambaSpec, CircularBufferSpec)
-        ]
-        self.block_size = (
-            math.lcm(*transfer_block_sizes)
-            if transfer_block_sizes
-            else cast(int, vllm_config.cache_config.block_size)
+        self.block_size = transfer_block_size(
+            kv_cache_config, cast(int, vllm_config.cache_config.block_size)
         )
         # Per-layer specs, unwrapping UniformTypeKVCacheSpecs group wrappers.
         self._layer_specs: dict[str, KVCacheSpec] = {}

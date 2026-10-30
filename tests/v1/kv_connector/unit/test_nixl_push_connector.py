@@ -364,6 +364,9 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._push_writer_wake = threading.Event()
         w._push_writer_stop = threading.Event()
         w._push_writer_thread = None
+        w._sending_results = queue.Queue()
+        w.chunkwise_push = False
+        w._init_chunkwise_state()
 
         # Base worker fields touched by start_load_kv / _get_new_notifs.
         w._recving_metadata = {}
@@ -981,6 +984,22 @@ class TestPushWriterNotifs:
         w._reqs_to_send[request_id] = time.perf_counter() + 60
         w._reqs_to_process.add(request_id)
         return request_id
+
+    def test_writer_progress_polls_writes_off_the_engine_thread(self):
+        """With push_writer_progress the writer drives WRITE completion (and
+        so NIXL's notif to D); the engine thread only consumes its results."""
+        w = self._pollable_worker()
+        w._writer_progress = True
+        request_id = self._make_sending_req(w)
+        w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+
+        assert w.get_transfer_results().finished_sending == set()
+        w.nixl_wrapper.check_xfer_state.assert_not_called()
+
+        w._poll_sending_transfers()
+        assert w.nixl_wrapper.check_xfer_state.call_count == 2
+        assert w.get_transfer_results().finished_sending == {request_id}
+        assert request_id not in w._reqs_to_send
 
     def test_failed_push_send_is_not_reported_done_sending(self):
         """A failed P-side WRITE must not surface as finished sending.
@@ -2148,3 +2167,957 @@ def test_layer_handshake_rejects_unsupported_geometry(
     assert not worker.kv_caches_base_addr
     with pytest.raises(KeyError):
         worker.transfer_topo.get_engine_info(metadata.engine_id)
+
+
+# ----------------------------------------------------------------- #
+#  Chunk-wise push                                                   #
+# ----------------------------------------------------------------- #
+
+_CW_P_ENGINE = "prefill-engine"
+_CW_D_ENGINE = "decode-engine"
+
+
+class _FakeCudaEvent:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def record(self, stream=None):
+        pass
+
+    def query(self) -> bool:
+        return True
+
+    def synchronize(self) -> None:
+        pass
+
+
+@pytest.fixture
+def fake_cuda_event():
+    with patch("torch.cuda.Event", _FakeCudaEvent):
+        yield
+
+
+def _chunkwise_worker(
+    *, num_regions: int = 2, num_blocks: int = 16, mamba: bool = False
+) -> _StubWriterWorker:
+    """P worker with ``num_regions`` KV regions (layers) of 4-token blocks,
+    plus a GDN-style state group when ``mamba``."""
+    from types import SimpleNamespace
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+        _RegionPairs,
+    )
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    w = _StubWriterWorker.fresh()
+    w.engine_id = _CW_P_ENGINE
+    w.chunkwise_push = True
+    w.use_mla = False
+    w.num_regions = num_regions
+    w.block_size = 4
+    w.region_num_blocks = [num_blocks] * num_regions
+    w.block_len_per_layer = [64] * num_regions
+    w._scratch_region_indices = []
+    w._ple_group_index = None
+    w.dst_num_blocks = {_CW_P_ENGINE: num_blocks, _CW_D_ENGINE: num_blocks}
+    w.dst_region_num_blocks = {
+        _CW_P_ENGINE: [num_blocks] * num_regions,
+        _CW_D_ENGINE: [num_blocks] * num_regions,
+    }
+    if mamba:
+        # Attention group 0 + state group 1; 3 conv sub-regions + 1 SSM each.
+        w._has_mamba = True
+        w._group_spec_types = (FullAttentionSpec, MambaSpec)
+        w._conv_decomp = SimpleNamespace(local_conv_offsets=[(0, 8)] * 3)
+        w._ssm_region_indices = list(range(num_regions))
+        w._group_region_indices = []
+    w._cw_attn_groups = [0]
+    # Region i pairs with D's region i, once per cache group it holds.
+    regions = list(range(num_regions))
+    groups = range(len(w._group_spec_types))
+    w._dst_pairs = {
+        _CW_D_ENGINE: _RegionPairs(
+            remote=regions * len(groups),
+            local=regions * len(groups),
+            group=[g for g in groups for _ in regions],
+            remote_regions=regions,
+            partner=regions,
+            remote_ssm_regions=regions if mamba else None,
+        )
+    }
+
+    w.transfer_topo = MagicMock()
+    w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
+        remote_tp_size=1, remote_block_size=4, remote_physical_blocks_per_logical=1
+    )
+    w.transfer_topo.tp_ratio.return_value = 1
+    w.tp_mappings = {
+        _CW_D_ENGINE: TPMapping(
+            source_ranks_per_group=((0,),) * len(w._group_spec_types),
+            all_source_ranks=(0,),
+            rank_to_attention_slot={0: 0},
+            rank_offset_factor=0,
+        )
+    }
+    w.src_xfer_handles_by_block_size = {4: 111}
+    w.dst_xfer_side_handles = {_CW_D_ENGINE: {0: 222}}
+    w._remote_agents = {_CW_D_ENGINE: {(0, 0): "d-agent"}}
+    w._ensure_handshake = lambda *args, **kwargs: None
+    handles = iter(range(1000, 2000))
+    w.nixl_wrapper = MagicMock()
+    w.nixl_wrapper.make_prepped_xfer.side_effect = lambda *a, **k: next(handles)
+    w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+    return w
+
+
+def _cw_step_meta(
+    req_id: str,
+    block_ids,
+    start_block: int = 0,
+    *,
+    last: bool = False,
+    num_prompt: int = 16,
+) -> NixlConnectorMetadata:
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        ChunkwisePushStep,
+    )
+
+    meta = NixlConnectorMetadata()
+    meta.push_chunkwise_steps[req_id] = ChunkwisePushStep(
+        block_ids=block_ids,
+        start_block=start_block,
+        num_prompt_tokens=num_prompt,
+        is_last=last,
+    )
+    return meta
+
+
+def _cw_next_step(w, preempted=(), aborted=()) -> None:
+    """Bind the next step's metadata, as the model runner does."""
+    meta = NixlConnectorMetadata()
+    meta.push_chunkwise_preempted = set(preempted)
+    meta.reqs_not_processed = set(aborted)
+    w.bind_chunkwise(meta)
+
+
+def _cw_finish(w, req_id: str, block_ids) -> None:
+    """The scheduler finished the request: its lease and block table."""
+    meta = NixlConnectorMetadata()
+    w._reqs_to_process.add(req_id)
+    meta.reqs_to_send[req_id] = time.perf_counter() + 30
+    meta.push_chunkwise_finished[req_id] = block_ids
+    w.start_load_kv(meta)
+
+
+def _cw_run(w) -> None:
+    """The writer loop's chunk-wise part."""
+    w._cw_process_inbox()
+    w._cw_progress()
+
+
+def _drain_tasks(w) -> list:
+    tasks = []
+    while not w._cw_inbox.empty():
+        tasks.append(w._cw_inbox.get_nowait())
+    return tasks
+
+
+def _cw_push_reg(w, request_id="d-req-1234abcd", local_block_ids=([8, 9, 10, 11],)):
+    reg = _registration_data(request_id, local_block_ids=local_block_ids)
+    w._handle_push_reg_notif(PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(reg))
+
+
+def _written(w) -> list[tuple[list[int], list[int], bytes]]:
+    return [
+        (list(c.args[2]), list(c.args[4]), c.kwargs["notif_msg"])
+        for c in w.nixl_wrapper.make_prepped_xfer.call_args_list
+    ]
+
+
+@pytest.mark.usefixtures("fake_cuda_event")
+class TestChunkwisePushSteps:
+    """The engine thread queues one task per request and step, and cancels
+    the pushes of preempted or aborted requests."""
+
+    def test_requests_of_a_step_share_its_event(self):
+        w = _chunkwise_worker()
+        meta = _cw_step_meta("req-a", ([0, 1],))
+        meta.push_chunkwise_steps |= _cw_step_meta(
+            "req-b", ([5],), 2, last=True
+        ).push_chunkwise_steps
+        w.wait_for_save(meta)
+        a, b = _drain_tasks(w)
+        assert (a.req_id, a.start, a.final) == ("req-a", 0, False)
+        assert (b.req_id, b.start, b.final) == ("req-b", 2, True)
+        assert a.event is b.event
+
+    def test_logical_blocks_expand_to_kernel_blocks(self):
+        from .utils import make_kv_cache_config
+
+        w = _chunkwise_worker()
+        w.kv_cache_config = make_kv_cache_config(block_size=8)
+        w._physical_blocks_per_logical_kv_block = 2
+        w.wait_for_save(_cw_step_meta("p-req", ([3],), 1))
+        (task,) = _drain_tasks(w)
+        assert task.start == 2
+        assert [list(group) for group in task.kernel_block_ids] == [[6, 7]]
+
+    def test_bind_cancels_preempted_and_aborted_requests(self):
+        w = _chunkwise_worker()
+        _cw_next_step(w, preempted={"req-a"}, aborted={"req-b"})
+        signals = {(s.req_id, s.kind) for s in _drain_tasks(w)}
+        assert signals == {("req-a", "fallback"), ("req-b", "drop")}
+        assert w._cw_cancelled == {"req-a", "req-b"}
+        assert w._cw_seq == 1
+
+    def test_bind_always_wakes_the_writer(self):
+        # A final WRITE waiting for this step needs no polling.
+        w = _chunkwise_worker()
+        _cw_next_step(w)
+        assert w._push_writer_wake.is_set()
+
+    def test_connector_binds_every_step(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
+            NixlPushConnector,
+        )
+
+        conn = object.__new__(NixlPushConnector)
+        conn.connector_worker = MagicMock(chunkwise_push=True)
+        meta = NixlConnectorMetadata()
+        conn.bind_connector_metadata(meta)
+        conn.connector_worker.bind_chunkwise.assert_called_once_with(meta)
+
+    def test_finished_requests_reach_the_writer_after_their_lease(self):
+        w = _chunkwise_worker()
+        _cw_finish(w, "p-req", ([0, 1],))
+        (signal,) = _drain_tasks(w)
+        assert (signal.req_id, signal.kind, signal.blocks) == (
+            "p-req",
+            "finished",
+            ([0, 1],),
+        )
+        assert "p-req" in w._reqs_to_send
+        assert w._push_writer_wake.is_set()
+
+
+@pytest.mark.usefixtures("fake_cuda_event")
+class TestChunkwisePushWriter:
+    def test_each_chunk_is_written_before_the_next_one(self):
+        w = _chunkwise_worker()
+        # D's request id differs from P's only in the random suffix.
+        _cw_push_reg(w, request_id="req-89abcdef")
+        w.nixl_wrapper.check_xfer_state.return_value = "PROC"
+        w.wait_for_save(_cw_step_meta("req-0123abcd", ([0, 1],)))
+        _cw_run(w)
+        # Chunk 1, every layer (region) in one WRITE, no notif yet.
+        assert _written(w) == [([0, 1, 16, 17], [8, 9, 24, 25], b"")]
+
+        _cw_next_step(w)
+        w.wait_for_save(_cw_step_meta("req-0123abcd", ([2, 3],), 2, last=True))
+        _cw_next_step(w)
+        _cw_run(w)
+        # The last chunk's WRITE carries the notif, so it waits for chunk 1.
+        assert w.nixl_wrapper.make_prepped_xfer.call_count == 1
+
+        w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+        w._cw_progress()
+        assert _written(w)[1] == ([2, 3, 18, 19], [10, 11, 26, 27], b"req-89abcdef:1")
+        w._cw_progress()
+        assert w._cw_done.get_nowait() == "req-0123abcd"
+        assert not w._cw_writes
+
+    def test_final_write_waits_for_the_next_steps_metadata(self):
+        w = _chunkwise_worker()
+        _cw_push_reg(w, request_id="p-req")
+        w.wait_for_save(_cw_step_meta("p-req", ([0, 1, 2, 3],), last=True))
+        _cw_run(w)
+        # The request may have been preempted while its last chunk computed.
+        assert not _written(w)
+        _cw_next_step(w)
+        w._cw_progress()
+        assert [notif for *_, notif in _written(w)] == [b"p-req:1"]
+
+    def test_preempted_after_its_last_chunk_never_notifies_decode(self):
+        w = _chunkwise_worker()
+        _cw_push_reg(w, request_id="p-req")
+        w.wait_for_save(_cw_step_meta("p-req", ([0, 1, 2, 3],), last=True))
+        _cw_run(w)
+        # Preempted while its last chunk computed: its blocks were freed.
+        _cw_next_step(w, preempted={"p-req"})
+        w._cw_progress()
+        _cw_run(w)
+        assert not _written(w)
+        assert not w._cw_writes and w._cw_done.empty()
+        # D's registration waits for the whole-request push on finish.
+        assert "p-req" in w._pending_d_registrations
+
+    def test_preempted_request_hands_registration_back_after_its_writes(self):
+        w = _chunkwise_worker()
+        _cw_push_reg(w, request_id="p-req")
+        w.nixl_wrapper.check_xfer_state.return_value = "PROC"
+        w.wait_for_save(_cw_step_meta("p-req", ([0, 1],)))
+        _cw_run(w)
+        _cw_next_step(w, preempted={"p-req"})
+        _cw_run(w)
+        # The in-flight chunk may still read the freed blocks: the
+        # whole-request push must land after it.
+        assert "p-req" in w._cw_writes and not w._pending_d_registrations
+        w._push_finished_blocks["p-req"] = ([4, 5, 6, 7],)
+        w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+        w._cw_progress()
+        assert not w._cw_writes
+        assert [c[:2] for c in w.start_push_calls] == [("p-req", ([4, 5, 6, 7],))]
+
+    def test_aborted_after_preemption_hands_nothing_back(self):
+        w = _chunkwise_worker()
+        _cw_push_reg(w, request_id="p-req")
+        w.nixl_wrapper.check_xfer_state.return_value = "PROC"
+        w.wait_for_save(_cw_step_meta("p-req", ([0, 1],)))
+        _cw_run(w)
+        _cw_next_step(w, preempted={"p-req"})
+        _cw_next_step(w, aborted={"p-req"})
+        w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+        _cw_run(w)
+        assert not w._cw_writes and not w._cw_cancelled
+        assert not w._pending_d_registrations
+
+    def test_preempted_after_decode_was_notified_is_not_pushed_again(self):
+        w = _chunkwise_worker()
+        _cw_push_reg(w, request_id="p-req")
+        w.nixl_wrapper.check_xfer_state.return_value = "PROC"
+        w.wait_for_save(_cw_step_meta("p-req", ([0, 1, 2, 3],), last=True))
+        _cw_next_step(w)
+        _cw_run(w)
+        w._cw_cancel("p-req", "fallback")
+        w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+        w._cw_progress()
+        # A second push could overwrite blocks D already decodes with.
+        assert not w._cw_writes and not w._pending_d_registrations
+        assert w._cw_done.empty()
+
+    def test_preempted_request_drops_its_queued_chunks(self):
+        w = _chunkwise_worker()
+        w.wait_for_save(_cw_step_meta("req-0123abcd", ([0, 1],)))
+        _cw_run(w)
+        _cw_next_step(w, preempted={"req-0123abcd"})
+        _cw_run(w)
+        # D registers late: no chunk of the freed blocks is written.
+        _cw_push_reg(w, request_id="req-89abcdef")
+        w._cw_progress()
+        assert not _written(w)
+        assert "req-89abcdef" in w._pending_d_registrations
+
+    def test_late_registration_coalesces_into_one_write(self):
+        w = _chunkwise_worker()
+        w.wait_for_save(_cw_step_meta("req-0123abcd", ([0, 1],)))
+        _cw_next_step(w)
+        w.wait_for_save(_cw_step_meta("req-0123abcd", ([2, 3],), 2, last=True))
+        _cw_next_step(w)
+        _cw_run(w)
+        assert w.nixl_wrapper.make_prepped_xfer.call_count == 0
+
+        _cw_push_reg(w, request_id="req-89abcdef")
+        w._cw_progress()
+        assert _written(w) == [
+            (
+                [0, 1, 16, 17, 2, 3, 18, 19],
+                [8, 9, 24, 25, 10, 11, 26, 27],
+                b"req-89abcdef:1",
+            )
+        ]
+        w._cw_progress()
+        assert w._cw_done.get_nowait() == "req-0123abcd"
+
+    def test_decode_prefix_hit_skips_blocks_decode_already_has(self):
+        w = _chunkwise_worker()
+        _cw_push_reg(w, request_id="p-req", local_block_ids=([8, 9],))
+        w.wait_for_save(_cw_step_meta("p-req", ([0, 1],)))
+        w.wait_for_save(_cw_step_meta("p-req", ([2, 3],), 2, last=True))
+        _cw_next_step(w)
+        _cw_run(w)
+        # D cached the first two blocks: only P's last two land in D's blocks.
+        assert _written(w) == [([2, 3, 18, 19], [8, 9, 24, 25], b"p-req:1")]
+
+    def test_decode_prefix_hit_longer_than_a_chunk(self):
+        w = _chunkwise_worker()
+        # 20 tokens in 5 blocks, prefilled 8 + 8 + 4; D cached 3 blocks.
+        w.wait_for_save(_cw_step_meta("p-req", ([0, 1],), num_prompt=20))
+        w.wait_for_save(_cw_step_meta("p-req", ([2, 3],), 2, num_prompt=20))
+        _cw_run(w)
+        _cw_push_reg(w, request_id="p-req", local_block_ids=([8, 9],))
+        w._cw_progress()
+        assert _written(w) == [([3, 19], [8, 24], b"")]
+
+        w.wait_for_save(_cw_step_meta("p-req", ([4],), 4, last=True, num_prompt=20))
+        _cw_next_step(w)
+        _cw_run(w)
+        assert _written(w)[1] == ([4, 20], [9, 25], b"p-req:1")
+
+    def test_mamba_state_is_written_with_the_last_chunk_only(self):
+        w = _chunkwise_worker(num_regions=1, mamba=True)
+        _cw_push_reg(w, request_id="p-req", local_block_ids=([8, 9], [12]))
+        w.wait_for_save(_cw_step_meta("p-req", ([0], []), num_prompt=8))
+        _cw_run(w)
+        w.wait_for_save(_cw_step_meta("p-req", ([1], [5]), 1, last=True, num_prompt=8))
+        _cw_next_step(w)
+        _cw_run(w)
+        (first, _, _), (last, last_remote, _) = _written(w)
+        assert first == [0]
+        # Attention block 1, then the 4 state sub-regions of state block 5.
+        assert last == [1, 16 + 5, 32 + 5, 48 + 5, 64 + 5]
+        assert last_remote == [9, 16 + 12, 32 + 12, 48 + 12, 64 + 12]
+
+    def test_unpairable_mamba_state_slots_fail_the_push(self):
+        w = _chunkwise_worker(num_regions=1, mamba=True)
+        # Like a whole-request WRITE: D may hold at most one extra slot.
+        _cw_push_reg(w, request_id="p-req", local_block_ids=([8, 9], [12, 13, 14]))
+        w.wait_for_save(_cw_step_meta("p-req", ([0, 1], [5]), last=True, num_prompt=8))
+        _cw_next_step(w)
+        _cw_run(w)
+        assert not _written(w)
+        assert w._cw_writes["p-req"].failed and w._cw_done.empty()
+
+    def test_heterogeneous_decode_is_pushed_whole_once_finished(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import push_worker
+
+        w = _chunkwise_worker()
+        w.transfer_topo.tp_ratio.return_value = 2
+        with patch.object(push_worker.logger, "warning_once") as warning_once:
+            _cw_push_reg(w, request_id="p-req")
+            w.wait_for_save(_cw_step_meta("p-req", ([0, 1],), num_prompt=12))
+            w.wait_for_save(_cw_step_meta("p-req", ([2],), 2, last=True, num_prompt=12))
+            _cw_next_step(w)
+            _cw_run(w)
+        # Not before the request finished, when its lease protects the blocks.
+        assert not w.start_push_calls and not _written(w)
+        assert warning_once.call_args.args[1:] == (_CW_D_ENGINE, "TP ratio 2")
+
+        _cw_finish(w, "p-req", ([0, 1, 2],))
+        _cw_run(w)
+        assert [c[:2] for c in w.start_push_calls] == [("p-req", ([0, 1, 2],))]
+        assert not w._cw_writes
+
+    def test_finished_before_heterogeneous_decode_registered(self):
+        w = _chunkwise_worker()
+        w.transfer_topo.get_engine_info.return_value.remote_block_size = 8
+        w.wait_for_save(_cw_step_meta("p-req", ([0, 1],), last=True, num_prompt=8))
+        _cw_next_step(w)
+        _cw_finish(w, "p-req", ([0, 1],))
+        _cw_run(w)
+        assert not w.start_push_calls
+        _cw_push_reg(w, request_id="p-req")
+        assert [c[:2] for c in w.start_push_calls] == [("p-req", ([0, 1],))]
+
+    def test_preempted_heterogeneous_request_takes_the_whole_request_path(self):
+        w = _chunkwise_worker()
+        w.transfer_topo.tp_ratio.return_value = 2
+        _cw_push_reg(w, request_id="p-req")
+        w.wait_for_save(_cw_step_meta("p-req", ([0, 1],), num_prompt=12))
+        _cw_run(w)
+        _cw_next_step(w, preempted={"p-req"})
+        _cw_run(w)
+        # The scheduler ships its blocks in push_finished_blocks on finish.
+        assert not w._cw_writes and not w.start_push_calls
+        assert "p-req" in w._pending_d_registrations
+
+    def test_failed_write_never_notifies_decode(self):
+        w = _chunkwise_worker()
+        _cw_push_reg(w, request_id="p-req")
+        w.nixl_wrapper.check_xfer_state.return_value = "ERR"
+        w.wait_for_save(_cw_step_meta("p-req", ([0, 1],)))
+        _cw_run(w)
+        w.wait_for_save(_cw_step_meta("p-req", ([2, 3],), 2, last=True))
+        _cw_next_step(w)
+        _cw_run(w)
+        _cw_run(w)
+        assert [notif for *_, notif in _written(w)] == [b""]
+        assert w._cw_done.empty()
+        # Kept to absorb the request's later tasks, until the lease expiry
+        # evicts it.
+        assert w._cw_writes["p-req"].failed
+        w._cw_cancel("p-req", "drop")
+        w._cw_progress()
+        assert not w._cw_writes
+
+    def test_failed_write_submission_never_notifies_decode(self):
+        w = _chunkwise_worker()
+        w.wait_for_save(_cw_step_meta("p-req", ([0, 1],)))
+        w.wait_for_save(_cw_step_meta("p-req", ([2, 3],), 2, last=True))
+        _cw_run(w)
+        # D registers before the next step: the queued chunk goes out alone.
+        w.nixl_wrapper.transfer.side_effect = [RuntimeError("transient"), None]
+        _cw_push_reg(w, request_id="p-req")
+        w._cw_progress()
+        _cw_next_step(w)
+        _cw_run(w)
+        assert [notif for *_, notif in _written(w)] == [b""]
+        assert w._cw_writes["p-req"].failed and w._cw_done.empty()
+
+    def test_error_fails_only_its_request(self):
+        w = _chunkwise_worker(num_regions=1)
+        _cw_push_reg(w, request_id="req-a", local_block_ids=([8, 9],))
+        _cw_push_reg(w, request_id="req-b", local_block_ids=([10, 11],))
+        compute_desc_ids = w._compute_desc_ids
+
+        def failing_for_block_1(*, block_ids, **kwargs):
+            if block_ids == [[1]]:
+                raise RuntimeError("descriptor error")
+            return compute_desc_ids(block_ids=block_ids, **kwargs)
+
+        w._compute_desc_ids = failing_for_block_1
+        for req_id, blocks in (("req-a", [0, 1]), ("req-b", [2, 3])):
+            w.wait_for_save(_cw_step_meta(req_id, (blocks[:1],), num_prompt=8))
+            w.wait_for_save(
+                _cw_step_meta(req_id, (blocks[1:],), 1, last=True, num_prompt=8)
+            )
+        _cw_next_step(w)
+        _cw_run(w)
+        w._cw_progress()
+        notifs = [notif for *_, notif in _written(w)]
+        assert b"req-b:1" in notifs and b"req-a:1" not in notifs
+        assert w._cw_done.get_nowait() == "req-b" and w._cw_done.empty()
+        assert w._cw_writes["req-a"].failed
+
+    def test_final_write_is_not_held_back_by_another_requests_step(self):
+        w = _chunkwise_worker(num_regions=1)
+        _cw_push_reg(w, request_id="req-a", local_block_ids=([8, 9],))
+        _cw_push_reg(w, request_id="req-b", local_block_ids=([10, 11],))
+        w.wait_for_save(_cw_step_meta("req-a", ([0, 1],), last=True, num_prompt=8))
+        _cw_next_step(w)
+        # B's step is still being computed on the GPU.
+        b_event = MagicMock()
+        b_event.query.return_value = False
+        with patch("torch.cuda.Event", return_value=b_event):
+            w.wait_for_save(_cw_step_meta("req-b", ([2],), num_prompt=8))
+
+        _cw_run(w)
+
+        # A's final WRITE (with D's notif) went out; B's waits for its step,
+        # without the writer blocking on it.
+        assert _written(w) == [([0, 1], [8, 9], b"req-a:1")]
+        b_event.synchronize.assert_not_called()
+        b_event.query.return_value = True
+        w._cw_progress()
+        assert _written(w)[1] == ([2], [10], b"")
+
+    def test_writer_sleeps_on_the_step_its_writes_wait_for(self):
+        w = _chunkwise_worker()
+        w.device_id = 0
+        _cw_push_reg(w, request_id="p-req")
+        event = MagicMock()
+        event.query.return_value = False
+        event.synchronize.side_effect = w._push_writer_stop.set
+        with patch("torch.cuda.Event", return_value=event):
+            w.wait_for_save(_cw_step_meta("p-req", ([0, 1],)))
+        w.nixl_wrapper.get_new_notifs.return_value = {}
+        # Waiting for a wake instead would miss the step.
+        w._push_writer_wake = MagicMock()
+        w._push_writer_wake.wait.side_effect = w._push_writer_stop.set
+        with patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker"
+            ".current_platform"
+        ):
+            w._push_writer_loop()
+        event.synchronize.assert_called_once()
+        assert not _written(w)
+
+    def test_writer_polls_only_what_has_no_wake_source(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
+            _ChunkwiseWrite,
+        )
+
+        w = _chunkwise_worker()
+        # A final WRITE waiting for the next step's metadata: bind wakes it.
+        _cw_push_reg(w, request_id="p-req")
+        w.wait_for_save(_cw_step_meta("p-req", ([0, 1, 2, 3],), last=True))
+        _cw_run(w)
+        assert w._cw_writes["p-req"].pending
+        assert not w._cw_needs_poll() and w._cw_next_event() is None
+        # PUSH_REG notifs only show up when polled.
+        w._cw_writes["q-req"] = _ChunkwiseWrite(num_prompt_tokens=8)
+        assert w._cw_needs_poll()
+        w._cw_writes["q-req"].failed = True
+        assert not w._cw_needs_poll()
+        # Nor do WRITE completions.
+        w._cw_writes["p-req"].handles = [7]
+        assert w._cw_needs_poll()
+
+    def test_abort_waits_for_the_final_write_in_flight(self):
+        w = _chunkwise_worker()
+        _cw_push_reg(w, request_id="p-req")
+        released, landed = threading.Event(), threading.Event()
+
+        def check_xfer_state(handle):
+            if not released.is_set():
+                return "PROC"
+            landed.set()
+            return "DONE"
+
+        w.nixl_wrapper.check_xfer_state.side_effect = check_xfer_state
+        w.wait_for_save(_cw_step_meta("p-req", ([0, 1, 2, 3],), last=True))
+        _cw_next_step(w)
+        _cw_run(w)
+        assert [notif for *_, notif in _written(w)] == [b"p-req:1"]
+
+        def writer():
+            while not w._push_writer_stop.is_set():
+                _cw_run(w)
+                time.sleep(0.001)
+
+        w._push_writer_thread = threading.Thread(target=writer, daemon=True)
+        w._push_writer_thread.start()
+        threading.Timer(0.1, released.set).start()
+        try:
+            # Under async scheduling the abort arrives after the final WRITE
+            # went out, and the next forward may reuse the request's blocks.
+            _cw_next_step(w, aborted={"p-req"})
+            assert landed.is_set()
+        finally:
+            w._push_writer_stop.set()
+            w._push_writer_thread.join()
+        assert not w._cw_writes and w._cw_done.empty()
+
+    def test_cancel_with_no_final_write_in_flight_does_not_wait(self):
+        w = _chunkwise_worker()
+        _cw_push_reg(w, request_id="p-req")
+        w.nixl_wrapper.check_xfer_state.return_value = "PROC"
+        w.wait_for_save(_cw_step_meta("p-req", ([0, 1],)))
+        _cw_run(w)
+        # A writer that never runs: a fence would block bind for 10s.
+        w._push_writer_thread = MagicMock()
+        _cw_next_step(w, aborted={"p-req"})
+        (signal,) = _drain_tasks(w)
+        assert (signal.kind, signal.fence) == ("drop", None)
+
+    def test_cancelled_final_write_is_not_posted(self):
+        w = _chunkwise_worker()
+        _cw_push_reg(w, request_id="p-req")
+        w.wait_for_save(_cw_step_meta("p-req", ([0, 1, 2, 3],), last=True))
+        _cw_run(w)
+        state = w._cw_writes["p-req"]
+        # Cancelled by bind_chunkwise, its message not handled yet.
+        w._cw_cancelled.add("p-req")
+        assert not w._cw_write_tasks(
+            "p-req", state, list(state.pending), notif=state.notif
+        )
+        assert not _written(w) and not w._cw_final_inflight
+
+    def test_telemetry_error_fails_the_push_and_releases_the_handle(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
+            _ChunkwiseWrite,
+        )
+
+        w = _chunkwise_worker()
+        state = w._cw_writes["p-req"] = _ChunkwiseWrite(num_prompt_tokens=8)
+        state.handles = [7]
+        w.nixl_wrapper.get_xfer_telemetry.side_effect = RuntimeError("telemetry")
+
+        w._cw_progress()
+
+        assert state.failed and state.handles == []
+        w.nixl_wrapper.release_xfer_handle.assert_called_once_with(7)
+
+    def test_completion_is_reported_once_the_lease_arrives(self):
+        w = _chunkwise_worker()
+        w._reqs_to_process.add("p-req")
+        w._cw_done.put("p-req")
+        assert w._pop_chunkwise_done() == set()
+        w._reqs_to_send["p-req"] = time.perf_counter() + 30
+        assert w._pop_chunkwise_done() == {"p-req"}
+        assert not w._cw_completed
+
+    def test_completed_push_of_an_aborted_request_is_forgotten(self):
+        w = _chunkwise_worker()
+        # Aborted after its push completed: no lease will come.
+        w._cw_done.put("p-req")
+        assert w._pop_chunkwise_done() == set()
+        assert not w._cw_completed
+
+    def test_writer_thread_uses_the_workers_device(self):
+        w = _chunkwise_worker()
+        w.device_id = 3
+        w._push_writer_stop.set()
+        with patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker"
+            ".current_platform"
+        ) as platform:
+            w._push_writer_loop()
+        platform.set_device.assert_called_once_with(3)
+
+    def test_shutdown_leaves_a_stuck_writers_handles(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
+            _ChunkwiseWrite,
+        )
+
+        w = _chunkwise_worker()
+        w._push_writer_thread = MagicMock()
+        w._push_writer_thread.is_alive.return_value = True
+        w._cw_writes["p-req"] = _ChunkwiseWrite(num_prompt_tokens=8, handles=[7])
+        with patch.object(NixlBaseConnectorWorker, "shutdown"):
+            w.shutdown()
+        w.nixl_wrapper.release_xfer_handle.assert_not_called()
+
+
+class TestChunkwisePushScheduler:
+    @staticmethod
+    def _scheduler(has_mamba: bool = False):
+        sched = make_nixl_push_scheduler(has_mamba=has_mamba, block_size=4)
+        _stub_sw_clipping(sched)
+        sched._chunkwise_push = True
+        return sched
+
+    @staticmethod
+    def _output(new=(), cached=(), preempted=(), num_scheduled=None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            scheduled_new_reqs=[
+                SimpleNamespace(req_id=r, block_ids=b, num_computed_tokens=n)
+                for r, b, n in new
+            ],
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=[r for r, _, _ in cached],
+                new_block_ids=[b for _, b, _ in cached],
+                num_computed_tokens=[n for _, _, n in cached],
+            ),
+            preempted_req_ids=set(preempted),
+            num_scheduled_tokens=num_scheduled or {},
+        )
+
+    @staticmethod
+    def _add_request(sched, num_prompt: int = 16, max_tokens: int = 1):
+        req = _make_request(request_id="p-req", is_d_side=False)
+        req.num_prompt_tokens = num_prompt
+        req.max_tokens = max_tokens
+        sched.update_state_after_alloc(req, _BlocksMock(([0],)), 0)
+        return req
+
+    def test_ships_the_blocks_each_step_completes(self):
+        sched = self._scheduler()
+        req = self._add_request(sched)
+        # 10 of 16 tokens: only the first two 4-token blocks are complete.
+        meta = sched.build_connector_meta(
+            self._output(new=[("p-req", ([0, 1, 2],), 0)], num_scheduled={"p-req": 10})
+        )
+        step = meta.push_chunkwise_steps["p-req"]
+        assert (step.block_ids, step.start_block, step.is_last) == (([0, 1],), 0, False)
+
+        # The last chunk ships the rest, its partial block included.
+        meta = sched.build_connector_meta(
+            self._output(cached=[("p-req", ([3],), 10)], num_scheduled={"p-req": 6})
+        )
+        step = meta.push_chunkwise_steps["p-req"]
+        assert (step.block_ids, step.start_block, step.is_last) == (([2, 3],), 2, True)
+
+        delay_free, _ = sched.request_finished(req, ([0, 1, 2, 3],))
+        assert delay_free
+        assert "p-req" in sched._reqs_need_send
+        assert "p-req" in sched._finished_request_blocks
+        assert not sched._newly_finished_push_blocks
+        assert not sched._cw_reqs
+
+        # Its block table goes out once, for a D of other geometry.
+        meta = sched.build_connector_meta(self._output())
+        assert meta.push_chunkwise_finished == {"p-req": ([0, 1, 2, 3],)}
+        assert not meta.push_finished_blocks
+        assert not sched.build_connector_meta(self._output()).push_chunkwise_finished
+
+    def test_request_decoding_after_its_prefill_is_pushed_whole(self):
+        sched = self._scheduler()
+        req = self._add_request(sched, num_prompt=8, max_tokens=4)
+        meta = sched.build_connector_meta(
+            self._output(new=[("p-req", ([0, 1],), 0)], num_scheduled={"p-req": 8})
+        )
+        assert not meta.push_chunkwise_steps
+        sched.request_finished(req, ([0, 1, 2],))
+        assert sched._newly_finished_push_blocks == {"p-req": ([0, 1, 2],)}
+
+    def test_step_without_a_completed_block_ships_nothing(self):
+        sched = self._scheduler()
+        self._add_request(sched)
+        meta = sched.build_connector_meta(
+            self._output(new=[("p-req", ([0],), 0)], num_scheduled={"p-req": 3})
+        )
+        assert not meta.push_chunkwise_steps
+        meta = sched.build_connector_meta(
+            self._output(cached=[("p-req", ([1],), 3)], num_scheduled={"p-req": 5})
+        )
+        assert meta.push_chunkwise_steps["p-req"].block_ids == ([0, 1],)
+
+    def test_last_chunk_leaves_out_lookahead_blocks(self):
+        sched = self._scheduler()
+        self._add_request(sched)
+        # Block 4 holds speculative-decoding lookahead slots, not prompt KV.
+        meta = sched.build_connector_meta(
+            self._output(
+                new=[("p-req", ([0, 1, 2, 3, 4],), 0)], num_scheduled={"p-req": 16}
+            )
+        )
+        assert meta.push_chunkwise_steps["p-req"].block_ids == ([0, 1, 2, 3],)
+
+    def test_mamba_state_ships_with_the_last_chunk_only(self):
+        sched = self._scheduler(has_mamba=True)
+        self._add_request(sched, num_prompt=8)
+        meta = sched.build_connector_meta(
+            self._output(new=[("p-req", ([0], [7]), 0)], num_scheduled={"p-req": 4})
+        )
+        assert meta.push_chunkwise_steps["p-req"].block_ids == ([0], [])
+        meta = sched.build_connector_meta(
+            self._output(cached=[("p-req", ([1], []), 4)], num_scheduled={"p-req": 4})
+        )
+        assert meta.push_chunkwise_steps["p-req"].block_ids == ([1], [7])
+
+    def test_no_steps_after_the_last_chunk(self):
+        sched = self._scheduler()
+        self._add_request(sched, num_prompt=8)
+        sched.build_connector_meta(
+            self._output(new=[("p-req", ([0, 1],), 0)], num_scheduled={"p-req": 8})
+        )
+        meta = sched.build_connector_meta(
+            self._output(cached=[("p-req", None, 8)], num_scheduled={"p-req": 1})
+        )
+        assert not meta.push_chunkwise_steps
+
+    def test_preempted_request_falls_back_to_whole_request_push(self):
+        sched = self._scheduler()
+        req = self._add_request(sched)
+        sched.build_connector_meta(
+            self._output(new=[("p-req", ([0, 1],), 0)], num_scheduled={"p-req": 8})
+        )
+        meta = sched.build_connector_meta(self._output(preempted=["p-req"]))
+        assert meta.push_chunkwise_preempted == {"p-req"}
+
+        # Resumed: it prefills again in new blocks, without chunk-wise push.
+        meta = sched.build_connector_meta(
+            self._output(
+                new=[("p-req", ([5, 6, 7, 8],), 0)], num_scheduled={"p-req": 16}
+            )
+        )
+        assert not meta.push_chunkwise_steps
+        assert not meta.push_chunkwise_preempted
+        sched.request_finished(req, ([5, 6, 7, 8],))
+        assert sched._newly_finished_push_blocks == {"p-req": ([5, 6, 7, 8],)}
+        assert not sched._cw_finished_blocks
+
+    def test_preempted_after_its_last_chunk_falls_back(self):
+        # Under async scheduling it can be preempted before it finished; the
+        # worker holds its final WRITE until this step's metadata.
+        sched = self._scheduler()
+        self._add_request(sched)
+        sched.build_connector_meta(
+            self._output(
+                new=[("p-req", ([0, 1, 2, 3],), 0)], num_scheduled={"p-req": 16}
+            )
+        )
+        meta = sched.build_connector_meta(self._output(preempted=["p-req"]))
+        assert meta.push_chunkwise_preempted == {"p-req"}
+
+    def test_request_listed_as_new_again_falls_back(self):
+        # E.g. the next turn of a resumable streaming session.
+        sched = self._scheduler()
+        self._add_request(sched)
+        sched.build_connector_meta(
+            self._output(new=[("p-req", ([0, 1],), 0)], num_scheduled={"p-req": 8})
+        )
+        meta = sched.build_connector_meta(
+            self._output(new=[("p-req", ([5, 6],), 0)], num_scheduled={"p-req": 8})
+        )
+        assert meta.push_chunkwise_preempted == {"p-req"}
+        assert not meta.push_chunkwise_steps
+
+    def test_aborted_request_is_dropped_without_push(self):
+        sched = self._scheduler()
+        req = _make_request(request_id="p-req", is_d_side=False, finished=False)
+        req.num_prompt_tokens = 16
+        req.max_tokens = 1
+        sched.update_state_after_alloc(req, _BlocksMock(([0, 1],)), 0)
+        assert sched.request_finished(req, ([0, 1],)) == (False, None)
+        assert not sched._cw_reqs and not sched._cw_finished_blocks
+        assert sched._reqs_not_processed == {"p-req"}
+
+
+@pytest.mark.parametrize(
+    ("kv_role", "swa_enabled", "pp_size", "attn_block_sizes", "policy", "reason"),
+    [
+        ("kv_producer", False, 1, (16,), "fail", None),
+        ("kv_consumer", False, 1, (16,), "fail", "prefill"),
+        ("kv_producer", True, 1, (16,), "fail", "SlidingWindowSpec"),
+        ("kv_producer", False, 2, (16,), "fail", "pipeline"),
+        ("kv_producer", False, 1, (16, 32), "fail", "block sizes"),
+        ("kv_producer", False, 1, (16,), "recompute", "recompute"),
+    ],
+)
+def test_chunkwise_push_support(
+    kv_role, swa_enabled, pp_size, attn_block_sizes, policy, reason
+):
+    from dataclasses import replace
+
+    from vllm.config import KVTransferConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+        chunkwise_push_unsupported_reason,
+    )
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec
+
+    from .utils import make_kv_cache_config
+
+    vllm_config = MagicMock()
+    vllm_config.kv_transfer_config = KVTransferConfig(
+        kv_connector="NixlPushConnector",
+        kv_role=kv_role,
+        kv_load_failure_policy=policy,
+    )
+    vllm_config.parallel_config.pipeline_parallel_size = pp_size
+    vllm_config.parallel_config.prefill_context_parallel_size = 1
+    vllm_config.parallel_config.decode_context_parallel_size = 1
+    kv_cache_config = make_kv_cache_config(
+        block_size=attn_block_sizes[0], swa_enabled=swa_enabled, mamba_enabled=True
+    )
+    attn_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
+    for i, block_size in enumerate(attn_block_sizes[1:]):
+        kv_cache_config.kv_cache_groups.append(
+            KVCacheGroupSpec([f"extra{i}"], replace(attn_spec, block_size=block_size))
+        )
+
+    got = chunkwise_push_unsupported_reason(vllm_config, kv_cache_config)
+    if reason is None:
+        assert got is None
+    else:
+        assert reason in got
+
+
+def test_transfer_block_size():
+    from dataclasses import replace
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+        transfer_block_size,
+    )
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+
+    from .utils import make_kv_cache_config
+
+    config = make_kv_cache_config(block_size=16, mamba_enabled=True)
+    attn_group, mamba_group = config.kv_cache_groups
+    assert transfer_block_size(config, 99) == 16
+    # The worker's block size: the lcm of the attention groups'.
+    extra = KVCacheGroupSpec(
+        ["extra"], replace(attn_group.kv_cache_spec, block_size=24)
+    )
+    config = KVCacheConfig(
+        num_blocks=100, kv_cache_tensors=[], kv_cache_groups=[attn_group, extra]
+    )
+    assert transfer_block_size(config, 99) == 48
+    config = KVCacheConfig(
+        num_blocks=100, kv_cache_tensors=[], kv_cache_groups=[mamba_group]
+    )
+    assert transfer_block_size(config, 99) == 99
+
+
+def test_match_request_id():
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+        match_request_id,
+    )
+
+    candidates = ["cmpl-1-0-0123abcd", "cmpl-1-0", "cmpl-2-0-89abcdef"]
+    assert match_request_id("cmpl-1-0", candidates) == "cmpl-1-0"
+    assert match_request_id("cmpl-2-0-fedcba98", candidates) == "cmpl-2-0-89abcdef"
+    assert match_request_id("cmpl-3-0-fedcba98", candidates) is None

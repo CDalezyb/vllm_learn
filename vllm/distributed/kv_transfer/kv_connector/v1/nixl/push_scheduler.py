@@ -17,6 +17,14 @@ In push mode, scheduler-side responsibilities are:
 * Both sides: ``has_pending_push_work`` keeps the engine main loop stepping
   while pushes are in flight. ``update_connector_output`` cleans up
   ``_finished_request_blocks`` once the WRITE completes.
+* P side, chunk-wise push (``chunkwise_push``): every step ships the blocks
+  each P request's prefill completes (``meta.push_chunkwise_steps``) so the
+  worker WRITEs each chunk's KV right after the step computes it, while the
+  next chunk is computed. Such requests (``max_tokens=1``) skip the
+  post-prefill (monolithic) WRITE, unless they are preempted: then they fall
+  back to it. Their block table still ships on finish
+  (``meta.push_chunkwise_finished``), for a D whose geometry rules out
+  chunk-wise WRITEs.
 
 A soft per-registration watchdog on the D scheduler fails requests that have
 been registered but not fulfilled within a configurable timeout.
@@ -35,10 +43,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
     NixlBaseConnectorScheduler,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    ChunkwisePushStep,
     NixlConnectorMetadata,
     ReqId,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    chunkwise_push_unsupported_reason,
+    transfer_block_size,
+)
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -49,6 +63,29 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+class _ChunkwiseReq:
+    """P-side chunk-wise push bookkeeping for one request."""
+
+    __slots__ = (
+        "num_prompt_tokens",
+        "block_ids",
+        "num_pushed_blocks",
+        "done",
+        "fallback",
+    )
+
+    def __init__(self, num_prompt_tokens: int):
+        self.num_prompt_tokens = num_prompt_tokens
+        # Logical block ids of every KV cache group allocated so far.
+        self.block_ids: list[list[int]] = []
+        # Attention blocks already shipped to the workers.
+        self.num_pushed_blocks = 0
+        # The last prefill step was shipped.
+        self.done = False
+        # Preempted: pushed whole when it finishes instead.
+        self.fallback = False
 
 
 class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
@@ -100,6 +137,24 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             )
         )
 
+        # P-side chunk-wise push: requests whose KV is WRITTEN chunk by chunk
+        # while they prefill.
+        self._chunkwise_push = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "chunkwise_push", False
+            )
+        )
+        if self._chunkwise_push and (
+            reason := chunkwise_push_unsupported_reason(vllm_config, kv_cache_config)
+        ):
+            logger.warning("Disabling NIXL chunk-wise push: %s.", reason)
+            self._chunkwise_push = False
+        self._cw_reqs: dict[ReqId, _ChunkwiseReq] = {}
+        # Block tables of finished chunk-wise requests, for the next step.
+        self._cw_finished_blocks: dict[ReqId, BlockIds] = {}
+        # The unit of ChunkwisePushStep.start_block, as the workers see it.
+        self._cw_block_size = transfer_block_size(kv_cache_config, self.block_size)
+
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int, bool]:
@@ -146,6 +201,17 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # matches what the worker expects on the next step.
         if params.get("do_remote_decode"):
             self._reqs_in_batch.add(request.request_id)
+            # Only requests that finish with their prefill (P legs): the final
+            # WRITE leaves before the request finished, so one decoding on
+            # could be preempted after D was notified, and pushed again.
+            if (
+                self._chunkwise_push
+                and request.max_tokens == 1
+                and request.request_id not in self._cw_reqs
+            ):
+                self._cw_reqs[request.request_id] = _ChunkwiseReq(
+                    request.num_prompt_tokens
+                )
 
         # P side with host-buffer offload: defer save to the worker.
         if self.use_host_buffer and params.get("do_remote_decode"):
@@ -249,6 +315,10 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         if not is_p_node:
             return False, None
 
+        # Chunk-wise requests already WROTE their KV while prefilling.
+        cw = self._cw_reqs.pop(request.request_id, None)
+        pushed_chunkwise = cw is not None and not cw.fallback
+
         if request.status not in (
             RequestStatus.FINISHED_LENGTH_CAPPED,
             RequestStatus.FINISHED_STOPPED,
@@ -276,7 +346,11 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             # Store finished blocks for worker-level matching with D
             # registrations (via NIXL notifications).
             self._finished_request_blocks[request.request_id] = block_ids
-            self._newly_finished_push_blocks[request.request_id] = block_ids
+            if pushed_chunkwise:
+                # Only used if D's geometry rules out chunk-wise WRITEs.
+                self._cw_finished_blocks[request.request_id] = block_ids
+            else:
+                self._newly_finished_push_blocks[request.request_id] = block_ids
 
         return delay_free_blocks, dict(
             do_remote_prefill=True,
@@ -337,7 +411,99 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             meta.push_finished_blocks = dict(self._newly_finished_push_blocks)
             self._newly_finished_push_blocks.clear()
 
+        if self._cw_finished_blocks:
+            meta.push_chunkwise_finished = dict(self._cw_finished_blocks)
+            self._cw_finished_blocks.clear()
+        if self._cw_reqs:
+            self._build_chunkwise_steps(meta, scheduler_output)
+
         return meta
+
+    def _build_chunkwise_steps(
+        self, meta: NixlConnectorMetadata, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Ship the blocks each chunk-wise request's prefill completes this
+        step, and fall back to the whole-request push for preempted ones."""
+        for req_id in scheduler_output.preempted_req_ids or ():
+            if (cw := self._cw_reqs.get(req_id)) is not None:
+                self._cw_fall_back(meta, req_id, cw)
+
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        for new_req in scheduler_output.scheduled_new_reqs:
+            cw = self._cw_reqs.get(new_req.req_id)
+            if cw is None or cw.fallback:
+                continue
+            if cw.block_ids:
+                # Listed as new after its first steps (e.g. a resumed streaming
+                # session): its blocks may have changed.
+                self._cw_fall_back(meta, new_req.req_id, cw)
+                continue
+            cw.block_ids = [list(group) for group in new_req.block_ids]
+            self._add_chunkwise_step(
+                meta,
+                new_req.req_id,
+                cw,
+                new_req.num_computed_tokens + num_scheduled_tokens[new_req.req_id],
+            )
+
+        cached = scheduler_output.scheduled_cached_reqs
+        for i, req_id in enumerate(cached.req_ids):
+            cw = self._cw_reqs.get(req_id)
+            if cw is None or cw.fallback or cw.done:
+                continue
+            if (new_block_ids := cached.new_block_ids[i]) is not None:
+                for group, new_ids in zip(cw.block_ids, new_block_ids, strict=True):
+                    group.extend(new_ids)
+            self._add_chunkwise_step(
+                meta,
+                req_id,
+                cw,
+                cached.num_computed_tokens[i] + num_scheduled_tokens[req_id],
+            )
+
+    def _add_chunkwise_step(
+        self,
+        meta: NixlConnectorMetadata,
+        req_id: ReqId,
+        cw: _ChunkwiseReq,
+        num_computed_tokens: int,
+    ) -> None:
+        """Ship the attention blocks that are complete after this step, and
+        with the request's last chunk the rest of them plus the Mamba state.
+        The last chunk stops at the prompt's blocks: lookahead slots allocated
+        for speculative decoding hold no prompt KV."""
+        start = cw.num_pushed_blocks
+        is_last = num_computed_tokens >= cw.num_prompt_tokens
+        if is_last:
+            end = cdiv(cw.num_prompt_tokens, self._cw_block_size)
+            groups = self.get_exchange_clipped_blocks(tuple(cw.block_ids))
+        else:
+            end = num_computed_tokens // self._cw_block_size
+            if end <= start:
+                return
+            groups = self.kv_cache_config.select_transfer_block_ids(cw.block_ids)
+        meta.push_chunkwise_steps[req_id] = ChunkwisePushStep(
+            block_ids=tuple(
+                (list(blocks) if is_last else [])
+                if self._ssm_spec_blocks[g] is not None
+                else blocks[start:end]
+                for g, blocks in enumerate(groups)
+            ),
+            start_block=start,
+            num_prompt_tokens=cw.num_prompt_tokens,
+            is_last=is_last,
+        )
+        cw.num_pushed_blocks = end
+        cw.done = is_last
+
+    @staticmethod
+    def _cw_fall_back(
+        meta: NixlConnectorMetadata, req_id: ReqId, cw: _ChunkwiseReq
+    ) -> None:
+        """Preempted: its blocks were freed, so the chunks already pushed may
+        be stale. Cancel its chunk-wise push; it is pushed whole on finish."""
+        cw.fallback = True
+        meta.push_chunkwise_preempted.add(req_id)
 
     def has_pending_push_work(self) -> bool:
         # Keep the engine main loop alive while we have:

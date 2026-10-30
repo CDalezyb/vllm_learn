@@ -270,6 +270,21 @@ class ReqMeta:
     region_blocks_to_zero: BlockIds | None = None
 
 
+@dataclass
+class ChunkwisePushStep:
+    """Blocks of one P request that the current prefill step completes.
+
+    Per transfer group, ``block_ids`` holds the request's attention blocks
+    ``[start_block, start_block + len)`` that become complete in this step and,
+    with the last step only, the Mamba state blocks.
+    """
+
+    block_ids: BlockIds
+    start_block: int
+    num_prompt_tokens: int
+    is_last: bool
+
+
 class NixlConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
@@ -291,6 +306,15 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # Push mode (P side): newly finished request blocks to be matched
         # against pending D registrations on the P worker.
         self.push_finished_blocks: dict[ReqId, BlockIds] = {}
+        # Chunk-wise push (P side): blocks the requests' prefill completes this
+        # step, so each chunk's KV is WRITTEN as soon as it is computed.
+        self.push_chunkwise_steps: dict[ReqId, ChunkwisePushStep] = {}
+        # Chunk-wise push (P side): requests preempted since the last step.
+        # Their chunk-wise push is cancelled; they are pushed whole on finish.
+        self.push_chunkwise_preempted: set[ReqId] = set()
+        # Chunk-wise push (P side): block tables of the chunk-wise requests
+        # that finished, for a D whose geometry needs a whole-request push.
+        self.push_chunkwise_finished: dict[ReqId, BlockIds] = {}
 
     def _add_new_req(
         self,
