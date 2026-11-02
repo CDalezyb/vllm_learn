@@ -635,6 +635,7 @@ def make_nixl_push_scheduler(
     sched.side_channel_port = 5600
     sched.is_bidirectional_kv_xfer_enabled = is_bidirectional_kv_xfer_enabled
     sched._has_mamba = has_mamba
+    sched._is_hma_required = False
     sched._bounded_replay = False
     sched.kv_cache_config = make_kv_cache_config(
         block_size=16,
@@ -653,6 +654,14 @@ def make_nixl_push_scheduler(
     sched._push_registration_deadlines = {}
     sched._finished_request_blocks = {}
     sched._newly_finished_push_blocks = {}
+    sched._chunked_push = False
+    sched._chunk_trackers = {}
+    sched._chunk_generation_updates = {}
+    sched._chunk_cancellations = set()
+    sched._next_chunk_job_id = 0
+    sched._pinned_chunk_jobs = {}
+    sched._gpu_block_pool = None
+    sched._num_workers = 1
     sched._push_registration_timeout = (
         push_registration_timeout
         if push_registration_timeout is not None

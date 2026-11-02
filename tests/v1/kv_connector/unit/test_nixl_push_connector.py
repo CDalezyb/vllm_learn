@@ -43,9 +43,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
     NixlAgentMetadata,
     NixlConnectorMetadata,
+    NixlPushChunkJob,
+    NixlPushWorkerMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
     NixlPushConnectorWorker,
+    _ChunkTask,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlKVConnectorStats,
@@ -57,6 +60,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_base_request_id,
 )
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.sched.output import KVConnectorBlockState, SchedulerOutput
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -89,6 +94,7 @@ def _make_request(
     req = MagicMock()
     req.request_id = request_id
     req.num_computed_tokens = 64
+    req.num_prompt_tokens = 64
 
     if is_d_side:
         # D-side request: do_remote_prefill=True -> prefill on a remote P.
@@ -332,6 +338,183 @@ class TestPushScheduler:
         assert d_req.request_id not in meta.push_registrations
 
 
+class TestChunkedPushScheduler:
+    def test_complete_chunks_pin_until_every_worker_finishes(self):
+        sched = make_nixl_push_scheduler()
+        sched._chunked_push = True
+        pool = BlockPool(
+            num_gpu_blocks=8,
+            enable_caching=False,
+            hash_block_size=16,
+        )
+        blocks = pool.get_new_blocks(3)
+        block_ids = [block.block_id for block in blocks]
+        sched.bind_gpu_block_pool(pool)
+
+        request = create_request(
+            num_tokens=40,
+            block_size=16,
+            do_remote_decode=True,
+        )
+        sched.update_state_after_alloc(
+            request,
+            _BlocksMock((block_ids,)),
+            num_external_tokens=0,
+        )
+
+        output = SchedulerOutput.make_empty()
+        output.num_scheduled_tokens = {request.request_id: 32}
+        output.preempted_req_ids = set()
+        output.kv_connector_block_state = KVConnectorBlockState(
+            req_ids={request.request_id},
+            resolve_block_ids=lambda _: (block_ids,),
+            boundary_state_offloads={},
+        )
+        first_meta = NixlConnectorMetadata()
+        sched._build_chunk_jobs(first_meta, output)
+
+        assert len(first_meta.push_chunk_jobs) == 1
+        first_job = first_meta.push_chunk_jobs[0]
+        assert (first_job.start_block, first_job.end_block, first_job.is_final) == (
+            0,
+            2,
+            False,
+        )
+        assert [block.ref_cnt for block in blocks] == [2, 2, 1]
+
+        request.num_computed_tokens = 32
+        output.num_scheduled_tokens = {request.request_id: 8}
+        final_meta = NixlConnectorMetadata()
+        sched._build_chunk_jobs(final_meta, output)
+
+        assert len(final_meta.push_chunk_jobs) == 1
+        final_job = final_meta.push_chunk_jobs[0]
+        assert (final_job.start_block, final_job.end_block, final_job.is_final) == (
+            2,
+            3,
+            True,
+        )
+        # The final job pins the whole table so a late registration can safely
+        # fall back to the stock monolithic WRITE.
+        assert [block.ref_cnt for block in blocks] == [3, 3, 2]
+
+        sched.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=NixlPushWorkerMetadata(
+                    completed_chunk_jobs={first_job.job_id: 1}
+                )
+            )
+        )
+        assert [block.ref_cnt for block in blocks] == [2, 2, 2]
+        sched.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=NixlPushWorkerMetadata(
+                    completed_chunk_jobs={final_job.job_id: 1}
+                )
+            )
+        )
+        assert [block.ref_cnt for block in blocks] == [1, 1, 1]
+
+        from vllm.v1.request import RequestStatus
+
+        request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        delay, params = sched.request_finished(request, (block_ids,))
+        assert delay is False
+        assert params is not None
+        assert sched._newly_finished_push_blocks == {}
+
+
+class TestChunkedPushBlockRanges:
+    @pytest.mark.parametrize(
+        ("start", "end", "total", "remote", "expected"),
+        [
+            (0, 2, 4, 4, (slice(0, 2), slice(0, 2))),
+            (0, 2, 4, 2, None),
+            (1, 4, 4, 2, (slice(2, 4), slice(0, 2))),
+            (2, 3, 4, 3, (slice(2, 3), slice(1, 2))),
+        ],
+    )
+    def test_maps_source_range_to_decode_suffix(
+        self, start, end, total, remote, expected
+    ):
+        job = NixlPushChunkJob(
+            job_id=0,
+            request_id="req",
+            generation=0,
+            local_block_ids=([1, 2, 3, 4],),
+            start_block=start,
+            end_block=end,
+            total_blocks=total,
+            is_final=False,
+        )
+        assert NixlPushConnectorWorker._chunk_block_ranges(job, remote) == expected
+
+    def test_rejects_decode_table_larger_than_prompt(self):
+        job = NixlPushChunkJob(
+            job_id=0,
+            request_id="req",
+            generation=0,
+            local_block_ids=([1],),
+            start_block=0,
+            end_block=1,
+            total_blocks=1,
+            is_final=True,
+        )
+        with pytest.raises(ValueError, match="more blocks"):
+            NixlPushConnectorWorker._chunk_block_ranges(job, 2)
+
+
+class TestChunkedPushCompletion:
+    @staticmethod
+    def _task(job_id: int, *, final: bool) -> _ChunkTask:
+        return _ChunkTask(
+            job=NixlPushChunkJob(
+                job_id=job_id,
+                request_id="req-p",
+                generation=0,
+                local_block_ids=([1, 2],),
+                start_block=job_id,
+                end_block=job_id + 1,
+                total_blocks=2,
+                is_final=final,
+            ),
+            event=MagicMock(),
+        )
+
+    def test_only_final_drained_generation_notifies_decode(self):
+        worker = _StubWriterWorker.fresh()
+        worker._chunked_push = True
+        first = self._task(10, final=False)
+        final = self._task(11, final=True)
+        worker._chunk_job_inbox.put(first)
+        worker._chunk_job_inbox.put(final)
+        worker._drain_chunk_job_inbox()
+        worker._chunk_registrations["req-p"] = {"request_id": "req-d"}
+
+        worker._finish_chunk_job(first)
+        assert worker._chunk_notify_inbox.empty()
+        worker._finish_chunk_job(final)
+        assert worker._chunk_notify_inbox.get_nowait()["request_id"] == "req-d"
+
+        meta = worker.build_connector_worker_meta()
+        assert isinstance(meta, NixlPushWorkerMetadata)
+        assert meta.completed_chunk_jobs == {10: 1, 11: 1}
+
+    def test_preempted_generation_completes_without_notification(self):
+        worker = _StubWriterWorker.fresh()
+        worker._chunked_push = True
+        stale = self._task(12, final=True)
+        worker._chunk_latest_generation["req-p"] = 1
+        worker._chunk_job_inbox.put(stale)
+
+        worker._drain_chunk_job_inbox()
+
+        assert worker._chunk_notify_inbox.empty()
+        meta = worker.build_connector_worker_meta()
+        assert isinstance(meta, NixlPushWorkerMetadata)
+        assert meta.completed_chunk_jobs == {12: 1}
+
+
 # ----------------------------------------------------------------- #
 #  Worker-side tests                                                 #
 # ----------------------------------------------------------------- #
@@ -364,6 +547,18 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._push_writer_wake = threading.Event()
         w._push_writer_stop = threading.Event()
         w._push_writer_thread = None
+        w._chunked_push = False
+        w._chunk_defer_timeout = 60.0
+        w._chunk_job_inbox = queue.Queue()
+        w._chunk_notify_inbox = queue.Queue()
+        w._chunk_deferred = []
+        w._chunk_latest_generation = {}
+        w._chunk_cancelled = set()
+        w._chunk_states = {}
+        w._chunk_registrations = {}
+        w._chunk_transfers = {}
+        w._completed_chunk_jobs = set()
+        w._chunk_lock = threading.Lock()
 
         # Base worker fields touched by start_load_kv / _get_new_notifs.
         w._recving_metadata = {}

@@ -10,6 +10,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, EngineId
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
+    KVConnectorWorkerMetadata,
 )
 from vllm.logger import init_logger
 
@@ -270,6 +271,43 @@ class ReqMeta:
     region_blocks_to_zero: BlockIds | None = None
 
 
+@dataclass(frozen=True)
+class NixlPushChunkJob:
+    """One producer-side chunk hand-off.
+
+    The scheduler pins ``local_block_ids`` until every worker reports
+    ``job_id`` complete. ``start_block`` and ``end_block`` address the single
+    transferable full-attention block table supported by the initial chunked
+    push implementation. The final job includes the complete table so the
+    worker can fall back to the existing monolithic WRITE when chunking is not
+    compatible with the peer.
+    """
+
+    job_id: int
+    request_id: ReqId
+    generation: int
+    local_block_ids: BlockIds
+    start_block: int
+    end_block: int
+    total_blocks: int
+    is_final: bool
+
+
+@dataclass
+class NixlPushWorkerMetadata(KVConnectorWorkerMetadata):
+    """Completed chunk jobs, counted across workers by the output aggregator."""
+
+    completed_chunk_jobs: dict[int, int] = field(default_factory=dict)
+
+    def aggregate(self, other: "KVConnectorWorkerMetadata") -> "NixlPushWorkerMetadata":
+        assert isinstance(other, NixlPushWorkerMetadata)
+        for job_id, count in other.completed_chunk_jobs.items():
+            self.completed_chunk_jobs[job_id] = (
+                self.completed_chunk_jobs.get(job_id, 0) + count
+            )
+        return self
+
+
 class NixlConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
@@ -291,6 +329,12 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # Push mode (P side): newly finished request blocks to be matched
         # against pending D registrations on the P worker.
         self.push_finished_blocks: dict[ReqId, BlockIds] = {}
+        # Push mode (P side): immutable prompt-block ranges that can be sent
+        # before the request finishes. Generation updates retire work from a
+        # preempted or aborted attempt without reusing its pinned source blocks.
+        self.push_chunk_jobs: list[NixlPushChunkJob] = []
+        self.push_chunk_generations: dict[ReqId, int] = {}
+        self.push_chunk_cancellations: set[ReqId] = set()
 
     def _add_new_req(
         self,

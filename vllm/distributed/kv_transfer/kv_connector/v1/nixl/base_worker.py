@@ -37,6 +37,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     CopyBlocksOp,
     KVConnectorTransferResults,
+    KVConnectorWorkerMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
@@ -3883,6 +3884,9 @@ class NixlBaseConnectorWorker:
                     decode_block_ids[i] = decode_block_ids[i][:num_blocks]
                     prefill_block_ids[i] = prefill_group[:num_blocks]
         return decode_block_ids, prefill_block_ids
+
+    def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
+        return None
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         """Get the KV transfer stats for the connector."""

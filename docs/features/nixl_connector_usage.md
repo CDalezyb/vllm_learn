@@ -3,6 +3,8 @@
 NixlConnector is a high-performance KV cache transfer connector for vLLM's disaggregated prefilling feature. It provides fully asynchronous send/receive operations using the NIXL library for efficient cross-process KV cache transfer.
 
 For feature compatibility details (supported model architectures, TP configurations, and feature interactions), see the [NixlConnector Compatibility Matrix](nixl_connector_compatibility.md).
+For WRITE-based push mode, including the optional completed-chunk pipeline,
+see [NIXL push-mode KV transfer](../design/nixl_kv_push_connector.md).
 
 ## Prerequisites
 
