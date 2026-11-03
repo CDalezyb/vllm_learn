@@ -39,6 +39,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
+    NixlPushConnector,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
     NixlAgentMetadata,
@@ -513,6 +516,76 @@ class TestChunkedPushCompletion:
         meta = worker.build_connector_worker_meta()
         assert isinstance(meta, NixlPushWorkerMetadata)
         assert meta.completed_chunk_jobs == {12: 1}
+
+
+class TestChunkedPushWaitForSave:
+    """Chunk jobs are handed to the writer in ``wait_for_save``, which runs
+    after the step's target and draft forwards."""
+
+    @staticmethod
+    def _metadata() -> NixlConnectorMetadata:
+        meta = NixlConnectorMetadata()
+        meta.push_chunk_jobs.append(
+            NixlPushChunkJob(
+                job_id=1,
+                request_id="req-p",
+                generation=2,
+                local_block_ids=([1, 2],),
+                start_block=0,
+                end_block=1,
+                total_blocks=2,
+                is_final=False,
+            )
+        )
+        meta.push_chunk_generations["req-p"] = 2
+        meta.push_chunk_cancellations.add("req-gone")
+        return meta
+
+    @staticmethod
+    def _worker() -> _StubWriterWorker:
+        worker = _StubWriterWorker.fresh()
+        worker._chunked_push = True
+        worker._send_heartbeats = lambda metadata: None
+        return worker
+
+    def test_start_load_kv_does_not_touch_chunk_state(self):
+        worker = self._worker()
+        worker.start_load_kv(self._metadata())
+        assert worker._chunk_job_inbox.empty()
+        assert worker._chunk_latest_generation == {}
+        assert worker._chunk_cancelled == set()
+        assert not worker._push_writer_wake.is_set()
+
+    def test_wait_for_save_records_event_and_enqueues_jobs(self):
+        worker = self._worker()
+        with patch("torch.cuda.Event") as event_cls:
+            worker.wait_for_save(self._metadata())
+        event_cls.return_value.record.assert_called_once_with()
+        task = worker._chunk_job_inbox.get_nowait()
+        assert task.job.job_id == 1
+        assert task.event is event_cls.return_value
+        assert worker._chunk_job_inbox.empty()
+        assert worker._chunk_latest_generation == {"req-p": 2}
+        assert worker._chunk_cancelled == {"req-gone"}
+        assert worker._push_writer_wake.is_set()
+
+    def test_wait_for_save_is_noop_without_chunked_push(self):
+        worker = self._worker()
+        worker._chunked_push = False
+        with patch("torch.cuda.Event") as event_cls:
+            worker.wait_for_save(self._metadata())
+        event_cls.assert_not_called()
+        assert worker._chunk_job_inbox.empty()
+        assert worker._chunk_latest_generation == {}
+
+    def test_connector_wait_for_save_forwards_to_worker(self):
+        connector = object.__new__(NixlPushConnector)
+        connector.connector_worker = MagicMock(use_host_buffer=False)
+        connector._connector_metadata = self._metadata()
+        connector.wait_for_save()
+        connector.connector_worker.wait_for_save.assert_called_once_with(
+            connector._connector_metadata
+        )
 
 
 # ----------------------------------------------------------------- #

@@ -21,7 +21,8 @@ Wake model: the writer self-polls every
 ``_push_finished_blocks`` (i.e. P-side blocks waiting for a D PUSH_REG
 notif that has no other wake source). All other progress is
 event-driven: the engine main thread sets ``_push_writer_wake`` from
-``start_load_kv`` (when handing it new work) and from ``get_finished``
+``start_load_kv`` and ``wait_for_save`` (when handing it new work) and
+from ``get_finished``
 (so each engine step gives the writer a chance to drain NIXL notifs);
 the handshake-completion callback sets the same event after a deferred
 PUSH_REG send or a deferred push WRITE has been queued. When a request's
@@ -274,21 +275,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 self._finished_blocks_inbox.put((req_id, block_ids))
             self._push_writer_wake.set()
 
-        if self._chunked_push:
-            with self._chunk_lock:
-                for req_id, generation in metadata.push_chunk_generations.items():
-                    self._chunk_latest_generation[req_id] = max(
-                        generation,
-                        self._chunk_latest_generation.get(req_id, -1),
-                    )
-                self._chunk_cancelled.update(metadata.push_chunk_cancellations)
-            if metadata.push_chunk_jobs:
-                event = torch.cuda.Event()
-                event.record()
-                for job in metadata.push_chunk_jobs:
-                    self._chunk_job_inbox.put(_ChunkTask(job=job, event=event))
-                self._push_writer_wake.set()
-
         # Batch + lease tracking (same as pull).
         for req_id in metadata.reqs_in_batch:
             self._reqs_to_process.add(req_id)
@@ -308,6 +294,29 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
         # Heartbeats still leave from the main thread (base worker behaviour).
         self._send_heartbeats(metadata)
+
+    def wait_for_save(self, metadata: NixlConnectorMetadata):
+        """Hand this step's completed prefill chunks to the writer.
+
+        ``wait_for_save`` runs after every target and draft forward of the
+        step, so the event recorded here covers all KV writes for these
+        chunks.
+        """
+        if not self._chunked_push:
+            return
+        with self._chunk_lock:
+            for req_id, generation in metadata.push_chunk_generations.items():
+                self._chunk_latest_generation[req_id] = max(
+                    generation,
+                    self._chunk_latest_generation.get(req_id, -1),
+                )
+            self._chunk_cancelled.update(metadata.push_chunk_cancellations)
+        if metadata.push_chunk_jobs:
+            event = torch.cuda.Event()
+            event.record()
+            for job in metadata.push_chunk_jobs:
+                self._chunk_job_inbox.put(_ChunkTask(job=job, event=event))
+            self._push_writer_wake.set()
 
     # --- Writer thread ------------------------------------------------- #
 

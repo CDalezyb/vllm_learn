@@ -439,6 +439,12 @@ class NixlPushConnector(NixlBaseConnector):
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         self.connector_worker.start_load_kv(self._connector_metadata)
 
+    def wait_for_save(self):
+        super().wait_for_save()
+        assert self.connector_worker is not None
+        assert isinstance(self._connector_metadata, NixlConnectorMetadata)
+        self.connector_worker.wait_for_save(self._connector_metadata)
+
 
 # Backward compatibility: NixlConnector is the pull-based connector.
 NixlConnector = NixlPullConnector

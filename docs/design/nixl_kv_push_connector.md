@@ -143,7 +143,9 @@ event:
    step with the scheduler's metadata) — sets the wake only when the
    step actually hands the writer new work, i.e. when
    ``meta.push_registrations`` or ``meta.push_finished_blocks`` is
-   non-empty. This is the wake for new transfers.
+   non-empty. This is the wake for new transfers. With chunked push,
+   **``wait_for_save``** (called after the step's target and draft
+   forwards) also sets it when it hands the writer new chunk jobs.
 2. **``get_finished``** (worker main thread, called once per engine
    step to report completions) — always sets the wake. The writer is
    the sole consumer of ``nixl_wrapper.get_new_notifs()`` for push,
