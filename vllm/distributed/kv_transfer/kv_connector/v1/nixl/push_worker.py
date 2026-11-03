@@ -520,7 +520,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 continue
 
             with self._chunk_lock:
-                if state.final_seen and not state.submitted_any:
+                # Send the whole request in one WRITE only when the final job
+                # is ready and no chunk went out before it (e.g. a
+                # single-chunk prompt).
+                if job.is_final and not state.submitted_any:
                     state.fallback = True
                 if not state.fallback and not self._chunk_path_supported(job, reg_data):
                     state.fallback = True

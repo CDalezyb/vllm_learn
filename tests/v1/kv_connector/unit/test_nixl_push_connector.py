@@ -588,6 +588,78 @@ class TestChunkedPushWaitForSave:
         )
 
 
+class TestChunkedPushFallback:
+    """Whole-request fallback is decided by the final job alone."""
+
+    @staticmethod
+    def _task(job_id: int, *, final: bool) -> _ChunkTask:
+        event = MagicMock()
+        event.query.return_value = False
+        return _ChunkTask(
+            job=NixlPushChunkJob(
+                job_id=job_id,
+                request_id="req-p",
+                generation=0,
+                local_block_ids=([1, 2],),
+                start_block=job_id,
+                end_block=job_id + 1,
+                total_blocks=2,
+                is_final=final,
+            ),
+            event=event,
+        )
+
+    @staticmethod
+    def _worker() -> tuple[_StubWriterWorker, list[tuple[int, bool]]]:
+        worker = _StubWriterWorker.fresh()
+        worker._chunked_push = True
+        worker._chunk_registrations["req-p"] = {
+            "request_id": "req-d",
+            "decode_engine_id": "d-engine",
+            "decode_host": "127.0.0.1",
+            "decode_port": 1234,
+            "decode_tp_size": 1,
+        }
+        worker._ensure_handshake = lambda *a, **k: None
+        worker._chunk_path_supported = lambda job, reg_data: True
+        submitted: list[tuple[int, bool]] = []
+
+        def submit(job, reg_data, *, fallback):
+            submitted.append((job.job_id, fallback))
+            return [object()], fallback, False
+
+        worker._submit_chunk_job = submit
+        return worker, submitted
+
+    def test_final_job_queued_before_first_chunk_is_ready(self):
+        # With async scheduling the final job can reach the writer while the
+        # first chunk is computing. Both chunks go out as chunk WRITEs.
+        worker, submitted = self._worker()
+        first = self._task(0, final=False)
+        final = self._task(1, final=True)
+        worker._chunk_job_inbox.put(first)
+        worker._chunk_job_inbox.put(final)
+        worker._drain_chunk_job_inbox()
+
+        first.event.query.return_value = True
+        worker._process_chunk_jobs()
+        assert submitted == [(0, False)]
+
+        final.event.query.return_value = True
+        worker._process_chunk_jobs()
+        assert submitted == [(0, False), (1, False)]
+
+    def test_single_chunk_request_falls_back_to_whole_write(self):
+        worker, submitted = self._worker()
+        final = self._task(0, final=True)
+        final.event.query.return_value = True
+        worker._chunk_job_inbox.put(final)
+        worker._drain_chunk_job_inbox()
+
+        worker._process_chunk_jobs()
+        assert submitted == [(0, True)]
+
+
 # ----------------------------------------------------------------- #
 #  Worker-side tests                                                 #
 # ----------------------------------------------------------------- #
