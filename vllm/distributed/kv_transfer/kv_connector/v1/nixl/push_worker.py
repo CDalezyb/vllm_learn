@@ -18,8 +18,10 @@ matched pushes whose P→D handshake has finished so the writer can
 
 Wake model: the writer self-polls every
 ``_PUSH_WRITER_POLL_INTERVAL_MS`` only while it has unmatched
-``_push_finished_blocks`` (i.e. P-side blocks waiting for a D PUSH_REG
-notif that has no other wake source). All other progress is
+``_push_finished_blocks`` (P-side blocks waiting for a D PUSH_REG notif
+that has no other wake source), chunk jobs waiting for their CUDA events,
+or in-flight chunk WRITEs of requests that have no more chunks to send.
+All other progress is
 event-driven: the engine main thread sets ``_push_writer_wake`` from
 ``start_load_kv`` and ``wait_for_save`` (when handing it new work) and
 from ``get_finished``
@@ -98,6 +100,9 @@ class _ChunkRequestState:
     fallback: bool = False
     failed: bool = False
     notification_in_transfer: bool = False
+    # The final job has been submitted or finished: no more chunk WRITEs
+    # will be issued for this generation.
+    final_processed: bool = False
 
 
 class NixlPushConnectorWorker(NixlBaseConnectorWorker):
@@ -174,6 +179,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         self._chunk_registrations: dict[ReqId, dict[str, Any]] = {}
         self._chunk_transfers: dict[int, tuple[_ChunkTask, list[TransferHandle]]] = {}
         self._completed_chunk_jobs: set[int] = set()
+        # Some in-flight chunk WRITE belongs to a request that has no more
+        # chunks to send; the writer self-polls while this is set.
+        self._chunk_closing_inflight = False
         self._chunk_lock = threading.Lock()
 
     # --- Lifecycle ----------------------------------------------------- #
@@ -376,6 +384,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                             self._pending_completion_notifs.put(notif)
 
                 self._process_chunk_jobs()
+                if self._chunk_transfers:
+                    self._poll_chunk_transfers()
                 while True:
                     try:
                         reg_data = self._chunk_notify_inbox.get_nowait()
@@ -386,9 +396,16 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 logger.exception("nixl-push-writer error; continuing")
 
             # Self-poll only while there is no other wake source: P-side
-            # finished blocks waiting for a D PUSH_REG match. All other
-            # progress is event-driven (see module docstring).
-            if self._push_finished_blocks or self._chunk_deferred:
+            # finished blocks waiting for a D PUSH_REG match, chunk jobs
+            # waiting for their CUDA events, and in-flight chunk WRITEs of
+            # requests with no more chunks to send (polled here so D is
+            # notified as soon as a request's last WRITE completes). All
+            # other progress is event-driven (see module docstring).
+            if (
+                self._push_finished_blocks
+                or self._chunk_deferred
+                or self._chunk_closing_inflight
+            ):
                 self._push_writer_stop.wait(timeout=sleep_s)
             else:
                 self._push_writer_wake.wait()
@@ -554,6 +571,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 state.submitted_any |= bool(handles)
                 state.notification_in_transfer |= notification_in_transfer
                 state.failed |= submission_failed
+                state.final_processed |= job.is_final
                 if handles:
                     self._chunk_transfers[job.job_id] = (task, handles)
             if not handles:
@@ -645,6 +663,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 return
             state.pending_jobs.discard(job.job_id)
             state.failed |= failed
+            state.final_processed |= job.is_final
             latest = self._chunk_latest_generation.get(job.request_id, job.generation)
             generation_retired = job.generation < latest
             if not state.pending_jobs and (state.final_seen or generation_retired):
@@ -1170,10 +1189,23 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             self._recving_transfers.setdefault(req_id, [])
         return set()
 
+    def _chunk_request_closing(self, job: NixlPushChunkJob) -> bool:
+        """Whether ``job``'s request will issue no more chunk WRITEs for its
+        generation: the final job was processed, or the generation was
+        retired by preemption or abort. Caller holds ``_chunk_lock``."""
+        state = self._chunk_states.get((job.request_id, job.generation))
+        latest = self._chunk_latest_generation.get(job.request_id, job.generation)
+        return state is None or state.final_processed or job.generation < latest
+
     def _poll_chunk_transfers(self) -> None:
+        """Check the chunk WRITEs of closing requests. D only needs to know
+        that all of a request's WRITEs completed, so WRITEs of requests that
+        still have chunks to send are left until the request closes."""
         completed: list[tuple[_ChunkTask, bool]] = []
         with self._chunk_lock:
             for job_id, (task, handles) in list(self._chunk_transfers.items()):
+                if not self._chunk_request_closing(task.job):
+                    continue
                 in_progress: list[TransferHandle] = []
                 failed = False
                 for handle in handles:
@@ -1209,6 +1241,11 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     completed.append((task, failed))
         for task, failed in completed:
             self._finish_chunk_job(task, failed=failed)
+        with self._chunk_lock:
+            self._chunk_closing_inflight = any(
+                self._chunk_request_closing(task.job)
+                for task, _ in self._chunk_transfers.values()
+            )
 
     def build_connector_worker_meta(self) -> NixlPushWorkerMetadata | None:
         if not self._chunked_push:
@@ -1227,8 +1264,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         self._push_writer_wake.set()
 
         results = super().get_transfer_results()
-        if self._chunked_push:
-            self._poll_chunk_transfers()
         done_sending = results.finished_sending
 
         # ``_pop_done_transfers`` mutates ``_sending_transfers``; the

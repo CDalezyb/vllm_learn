@@ -170,7 +170,13 @@ event:
 
 In addition to event-driven wakes, the writer self-polls at
 ``_PUSH_WRITER_POLL_INTERVAL_MS = 1.0`` ms while there are P-side
-finished blocks waiting for an unmatched ``PUSH_REG``.
+finished blocks waiting for an unmatched ``PUSH_REG``. With chunked
+push it also self-polls while chunk jobs wait for their CUDA events or
+while chunk WRITEs of a request that has no more chunks to send are in
+flight. A request's WRITEs are checked only from then on (its final job
+was submitted, or the request was preempted or aborted): D needs only
+the completion of all of them, and the writer sends D the completion
+notification as soon as the last one finishes.
 
 When a request completes on P (lease expires or the WRITE finishes),
 ``get_finished`` enqueues the request id onto ``_evict_finished_inbox``,

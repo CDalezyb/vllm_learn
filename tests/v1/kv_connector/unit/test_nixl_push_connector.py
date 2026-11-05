@@ -660,6 +660,198 @@ class TestChunkedPushFallback:
         assert submitted == [(0, True)]
 
 
+class TestChunkedPushCompletionPolling:
+    """A request's chunk WRITEs are checked only once it has no more chunks
+    to send: its final job was processed, or its generation was retired."""
+
+    @staticmethod
+    def _task(job_id: int, *, final: bool) -> _ChunkTask:
+        event = MagicMock()
+        event.query.return_value = False
+        return _ChunkTask(
+            job=NixlPushChunkJob(
+                job_id=job_id,
+                request_id="req-p",
+                generation=0,
+                local_block_ids=([1, 2],),
+                start_block=job_id,
+                end_block=job_id + 1,
+                total_blocks=2,
+                is_final=final,
+            ),
+            event=event,
+        )
+
+    @staticmethod
+    def _worker() -> tuple[_StubWriterWorker, dict[str, str]]:
+        """A worker whose chunk WRITE for job ``n`` has handle ``hn``; the
+        returned dict sets each handle's transfer state."""
+        worker = _StubWriterWorker.fresh()
+        worker._chunked_push = True
+        worker.world_size = 1
+        worker.xfer_stats = MagicMock()
+        worker._remote_agents = {"d-engine": {0: "agent-d"}}
+        worker._chunk_registrations["req-p"] = {
+            "request_id": "req-d",
+            "decode_engine_id": "d-engine",
+            "decode_host": "127.0.0.1",
+            "decode_port": 1234,
+            "decode_tp_size": 1,
+        }
+        worker._ensure_handshake = lambda *a, **k: None
+        worker._chunk_path_supported = lambda job, reg_data: True
+        worker._submit_chunk_job = lambda job, reg_data, *, fallback: (
+            [f"h{job.job_id}"],
+            False,
+            False,
+        )
+        states: dict[str, str] = {}
+        worker.nixl_wrapper = MagicMock()
+        worker.nixl_wrapper.get_new_notifs.return_value = {}
+        worker.nixl_wrapper.check_xfer_state.side_effect = lambda h: states[h]
+        return worker, states
+
+    @staticmethod
+    def _queue(worker: _StubWriterWorker, *tasks: _ChunkTask) -> None:
+        for task in tasks:
+            worker._chunk_job_inbox.put(task)
+        worker._drain_chunk_job_inbox()
+
+    @staticmethod
+    def _submit(worker: _StubWriterWorker, *tasks: _ChunkTask) -> None:
+        for task in tasks:
+            task.event.query.return_value = True
+        worker._process_chunk_jobs()
+
+    @staticmethod
+    def _run_writer(
+        worker: _StubWriterWorker, until: threading.Event, timeout: float = 2.0
+    ) -> bool:
+        t = threading.Thread(target=worker._push_writer_loop, daemon=True)
+        t.start()
+        try:
+            return until.wait(timeout=timeout)
+        finally:
+            worker._push_writer_stop.set()
+            worker._push_writer_wake.set()
+            t.join(timeout=2)
+
+    def test_writes_are_checked_only_after_final_job_is_submitted(self):
+        worker, states = self._worker()
+        first, final = self._task(0, final=False), self._task(1, final=True)
+        self._queue(worker, first, final)
+
+        self._submit(worker, first)
+        states["h0"] = "DONE"
+        worker._poll_chunk_transfers()
+        worker.nixl_wrapper.check_xfer_state.assert_not_called()
+        assert not worker._chunk_closing_inflight
+
+        self._submit(worker, final)
+        states["h1"] = "PROC"
+        worker._poll_chunk_transfers()
+        checked = {
+            c.args[0] for c in worker.nixl_wrapper.check_xfer_state.call_args_list
+        }
+        assert checked == {"h0", "h1"}
+        assert worker._chunk_closing_inflight
+        assert worker._chunk_notify_inbox.empty()
+
+        states["h1"] = "DONE"
+        worker._poll_chunk_transfers()
+        assert worker._chunk_notify_inbox.get_nowait()["request_id"] == "req-d"
+        assert not worker._chunk_closing_inflight
+        meta = worker.build_connector_worker_meta()
+        assert meta.completed_chunk_jobs == {0: 1, 1: 1}
+
+    @pytest.mark.parametrize("final_submission", ["no_write", "raises"])
+    def test_final_job_without_write_closes_the_request(self, final_submission):
+        # The final job issues no WRITE, either because nothing is left to
+        # send or because its submission fails. The earlier WRITE is still
+        # checked so its source blocks are released.
+        worker, states = self._worker()
+        first, final = self._task(0, final=False), self._task(1, final=True)
+        self._queue(worker, first, final)
+        self._submit(worker, first)
+        states["h0"] = "DONE"
+
+        def submit(job, reg_data, *, fallback):
+            if final_submission == "raises":
+                raise RuntimeError("submission failed")
+            return [], False, False
+
+        worker._submit_chunk_job = submit
+        self._submit(worker, final)
+        worker._poll_chunk_transfers()
+
+        worker.nixl_wrapper.check_xfer_state.assert_called_once_with("h0")
+        assert worker._chunk_transfers == {}
+        notified = not worker._chunk_notify_inbox.empty()
+        assert notified is (final_submission == "no_write")
+        meta = worker.build_connector_worker_meta()
+        assert meta.completed_chunk_jobs == {0: 1, 1: 1}
+
+    def test_retired_generation_writes_are_checked_without_notifying_decode(self):
+        worker, states = self._worker()
+        first = self._task(0, final=False)
+        self._queue(worker, first)
+        self._submit(worker, first)
+        states["h0"] = "DONE"
+        worker._poll_chunk_transfers()
+        worker.nixl_wrapper.check_xfer_state.assert_not_called()
+
+        meta = NixlConnectorMetadata()
+        meta.push_chunk_generations["req-p"] = 1
+        worker.wait_for_save(meta)
+        worker._poll_chunk_transfers()
+
+        worker.nixl_wrapper.check_xfer_state.assert_called_once_with("h0")
+        assert worker._chunk_transfers == {}
+        assert worker._chunk_notify_inbox.empty()
+        assert worker.build_connector_worker_meta().completed_chunk_jobs == {0: 1}
+
+    def test_writer_notifies_decode_when_last_write_completes(self):
+        # Only the writer thread runs: it polls the closing request's WRITEs
+        # by itself and notifies D once the last one completes.
+        worker, states = self._worker()
+        first, final = self._task(0, final=False), self._task(1, final=True)
+        self._queue(worker, first, final)
+        self._submit(worker, first, final)
+        states["h0"] = "DONE"
+        polls = iter(["PROC", "PROC"])
+        worker.nixl_wrapper.check_xfer_state.side_effect = lambda h: (
+            states[h] if h == "h0" else next(polls, "DONE")
+        )
+        notified = threading.Event()
+        worker.nixl_wrapper.send_notif.side_effect = lambda *a, **k: notified.set()
+
+        assert self._run_writer(worker, notified), "writer did not notify decode"
+        worker.nixl_wrapper.send_notif.assert_called_once_with(
+            "agent-d", notif_msg=b"req-d:1"
+        )
+        assert worker._chunk_transfers == {}
+
+    def test_writer_sleeps_while_only_open_requests_have_writes_in_flight(self):
+        worker, states = self._worker()
+        first = self._task(0, final=False)
+        self._queue(worker, first)
+        self._submit(worker, first)
+        states["h0"] = "PROC"
+        polls: list[float] = []
+        original = worker._poll_chunk_transfers
+
+        def counted():
+            polls.append(time.perf_counter())
+            original()
+
+        worker._poll_chunk_transfers = counted
+        self._run_writer(worker, threading.Event(), timeout=0.2)
+
+        # The writer runs one pass and then sleeps until woken.
+        assert len(polls) <= 3
+        worker.nixl_wrapper.check_xfer_state.assert_not_called()
+
+
 # ----------------------------------------------------------------- #
 #  Worker-side tests                                                 #
 # ----------------------------------------------------------------- #
@@ -702,6 +894,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._chunk_states = {}
         w._chunk_registrations = {}
         w._chunk_transfers = {}
+        w._chunk_closing_inflight = False
         w._completed_chunk_jobs = set()
         w._chunk_lock = threading.Lock()
 
