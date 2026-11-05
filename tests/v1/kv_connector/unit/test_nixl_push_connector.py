@@ -26,11 +26,13 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import Future
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import msgspec
 import pytest
+import torch
 
 from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -49,6 +51,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlPushChunkJob,
     NixlPushWorkerMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_scheduler import (
+    NixlPushConnectorScheduler,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
     NixlPushConnectorWorker,
     _ChunkTask,
@@ -61,16 +66,26 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     TPMapping,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    chunked_push_unsupported_reason,
     get_base_request_id,
 )
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.sched.output import KVConnectorBlockState, SchedulerOutput
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MLAAttentionSpec,
+    SparseCacheRole,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.outputs import KVConnectorOutput
 
 from .utils import (
     create_request,
+    create_vllm_config,
     expand_strided_descs,
+    make_kv_cache_config,
     make_nixl_push_scheduler,
     region_pairs_by_index,
 )
@@ -339,6 +354,98 @@ class TestPushScheduler:
         assert d_req.request_id not in sched._push_registration_deadlines
         assert d_req.request_id not in sched._push_pending_registrations
         assert d_req.request_id not in meta.push_registrations
+
+
+class TestChunkedPushSupport:
+    """Chunked push is enabled only where it can run; otherwise the producer
+    starts normally with the whole-request push and logs why."""
+
+    @staticmethod
+    def _vllm_config(kv_role: str = "kv_producer", pp: int = 1, pcp: int = 1):
+        return SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(kv_role=kv_role),
+            parallel_config=SimpleNamespace(
+                pipeline_parallel_size=pp, prefill_context_parallel_size=pcp
+            ),
+        )
+
+    def test_full_attention_producer_is_supported(self):
+        reason = chunked_push_unsupported_reason(
+            self._vllm_config(), make_kv_cache_config(16), use_host_buffer=False
+        )
+        assert reason is None
+
+    def test_sparse_mla_with_indexer_is_supported(self):
+        # DeepSeek sparse attention: per-token MLA and indexer caches share one
+        # transfer group, so their blocks are final once full like plain MLA.
+        specs = {
+            "attn": MLAAttentionSpec(
+                block_size=64, num_kv_heads=1, head_size=576, dtype=torch.bfloat16
+            ),
+            "indexer": MLAAttentionSpec(
+                block_size=64,
+                num_kv_heads=1,
+                head_size=132,
+                dtype=torch.uint8,
+                cache_role=SparseCacheRole.INDEXER,
+            ),
+        }
+        group_spec = UniformTypeKVCacheSpecs.from_specs(specs)
+        assert group_spec is not None
+        kv_cache_config = KVCacheConfig(
+            num_blocks=100,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(list(specs), group_spec)],
+        )
+        reason = chunked_push_unsupported_reason(
+            self._vllm_config(), kv_cache_config, use_host_buffer=False
+        )
+        assert reason is None
+
+    @pytest.mark.parametrize(
+        ("config", "kv_cache", "host_buffer", "expected"),
+        [
+            ({"kv_role": "kv_both"}, {}, False, "kv_role is 'kv_both'"),
+            ({}, {}, True, "kv_buffer_device='cpu'"),
+            ({"pp": 2}, {}, False, "pipeline_parallel_size is 2"),
+            ({"pcp": 2}, {}, False, "prefill_context_parallel_size is 2"),
+            ({}, {"mamba_enabled": True}, False, "[FullAttentionSpec, MambaSpec]"),
+            (
+                {},
+                {"swa_enabled": True},
+                False,
+                "[FullAttentionSpec, SlidingWindowSpec]",
+            ),
+        ],
+    )
+    def test_unsupported_configuration_reports_reason(
+        self, config, kv_cache, host_buffer, expected
+    ):
+        reason = chunked_push_unsupported_reason(
+            self._vllm_config(**config),
+            make_kv_cache_config(16, **kv_cache),
+            use_host_buffer=host_buffer,
+        )
+        assert reason is not None and expected in reason
+
+    @pytest.mark.parametrize("hybrid", [False, True])
+    def test_scheduler_falls_back_instead_of_failing(self, hybrid):
+        vllm_config = create_vllm_config(
+            kv_connector="NixlPushConnector",
+            kv_role="kv_producer",
+            kv_connector_extra_config={"enable_chunked_push": True},
+        )
+        module = "vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_scheduler"
+        with patch(f"{module}.logger") as log:
+            sched = NixlPushConnectorScheduler(
+                vllm_config, "p-engine", make_kv_cache_config(16, mamba_enabled=hybrid)
+            )
+        assert sched._chunked_push is not hybrid
+        if hybrid:
+            fmt, reason = log.warning.call_args.args
+            assert "chunked push is disabled" in fmt and "MambaSpec" in reason
+        else:
+            log.warning.assert_not_called()
 
 
 class TestChunkedPushScheduler:

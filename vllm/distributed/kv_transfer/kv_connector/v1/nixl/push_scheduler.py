@@ -41,9 +41,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlPushWorkerMetadata,
     ReqId,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    chunked_push_unsupported_reason,
+)
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
-from vllm.v1.kv_cache_interface import is_full_attention_spec
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -125,25 +127,16 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         self._num_workers = vllm_config.parallel_config.world_size
 
         if self._chunked_push:
-            transfer_groups = kv_cache_config.transfer_groups
-            if vllm_config.kv_transfer_config.kv_role != "kv_producer":
-                self._chunked_push = False
-            elif self.use_host_buffer:
-                raise ValueError("NIXL chunked push requires a device KV buffer")
-            elif vllm_config.parallel_config.pipeline_parallel_size != 1:
-                raise ValueError("NIXL chunked push currently requires PP=1")
-            elif (
-                vllm_config.parallel_config.prefill_context_parallel_size != 1
-                or vllm_config.parallel_config.decode_context_parallel_size != 1
-            ):
-                raise ValueError("NIXL chunked push currently requires PCP=DCP=1")
-            elif len(transfer_groups) != 1 or not is_full_attention_spec(
-                transfer_groups[0].kv_cache_spec
-            ):
-                raise ValueError(
-                    "NIXL chunked push currently requires one full-attention "
-                    "transfer group"
+            reason = chunked_push_unsupported_reason(
+                vllm_config, kv_cache_config, self.use_host_buffer
+            )
+            if reason is not None:
+                logger.warning(
+                    "NIXL chunked push is disabled: %s. Requests use the "
+                    "whole-request push.",
+                    reason,
                 )
+                self._chunked_push = False
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         self._gpu_block_pool = gpu_block_pool

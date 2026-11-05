@@ -68,7 +68,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     ReadSpec,
     _is_attention_spec,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import get_base_request_id
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    chunked_push_unsupported_reason,
+    get_base_request_id,
+)
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -163,9 +166,12 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         self._push_writer_thread: threading.Thread | None = None
 
         extra_config = self.kv_transfer_config.kv_connector_extra_config
-        self._chunked_push = bool(
-            extra_config.get("enable_chunked_push", False)
-            and self.kv_transfer_config.is_kv_producer
+        # The scheduler logs the reason when chunked push is disabled.
+        self._chunked_push = bool(extra_config.get("enable_chunked_push", False)) and (
+            chunked_push_unsupported_reason(
+                vllm_config, kv_cache_config, self.use_host_buffer
+            )
+            is None
         )
         self._chunk_defer_timeout = float(
             extra_config.get("chunked_push_defer_timeout", 60.0)
@@ -470,14 +476,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
     def _chunk_path_supported(
         self, job: NixlPushChunkJob, reg_data: dict[str, Any]
     ) -> bool:
-        if (
-            self.use_host_buffer
-            or self._has_mamba
-            or self.pp_size != 1
-            or self.pcp_size != 1
-            or self.dcp_size != 1
-        ):
-            return False
         local = self._as_grouped_block_ids(job.local_block_ids)
         remote = self._as_grouped_block_ids(reg_data["local_block_ids"])
         if len(local) != 1 or len(remote) != 1:
