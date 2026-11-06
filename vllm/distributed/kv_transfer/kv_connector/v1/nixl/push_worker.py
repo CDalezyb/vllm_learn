@@ -64,7 +64,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     ReadSpec,
     _is_attention_spec,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import get_base_request_id
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    chunked_push_group,
+    get_base_request_id,
+)
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -163,6 +166,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         self._chunk_defer_timeout = float(
             extra_config.get("chunked_push_defer_timeout", 60.0)
         )
+        self._chunked_group = chunked_push_group(self.kv_cache_config)
         self._chunk_job_inbox: queue.Queue[_ChunkTask] = queue.Queue()
         self._pending_chunk_jobs: list[NixlPushChunkJob] = []
         self._chunk_deferred: list[_ChunkTask] = []
@@ -464,8 +468,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
     def _chunk_path_supported(
         self, job: NixlPushChunkJob, reg_data: dict[str, Any]
     ) -> bool:
+        local = self._as_grouped_block_ids(job.local_block_ids)
         remote = self._as_grouped_block_ids(reg_data["local_block_ids"])
-        if len(remote) != 1:
+        if len(remote) != len(local):
             return False
         engine_id = reg_data["decode_engine_id"]
         assert self.transfer_topo is not None
@@ -480,7 +485,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 self.world_size,
             )
             return False
-        return job.total_blocks >= len(remote[0])
+        chunked = self._chunked_group
+        assert chunked is not None
+        return job.total_blocks >= len(remote[chunked])
 
     def _process_chunk_jobs(self) -> None:
         if not self._chunk_deferred:
@@ -583,12 +590,25 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             remote = remote_groups
             notif_msg = None
         else:
-            ranges = self._chunk_block_ranges(job, len(remote_groups[0]))
-            if ranges is None:
+            # The chunked group sends this chunk's range of D's uncached
+            # suffix; the other groups go out whole with the final job.
+            chunked = self._chunked_group
+            assert chunked is not None
+            local_lists: list[list[int]] = [[] for _ in local_groups]
+            remote_lists: list[list[int]] = [[] for _ in remote_groups]
+            ranges = self._chunk_block_ranges(job, len(remote_groups[chunked]))
+            if ranges is not None:
+                local_range, remote_range = ranges
+                local_lists[chunked] = list(local_groups[chunked][local_range])
+                remote_lists[chunked] = list(remote_groups[chunked][remote_range])
+            if job.is_final:
+                for group in range(len(local_groups)):
+                    if group != chunked:
+                        local_lists[group] = list(local_groups[group])
+                        remote_lists[group] = list(remote_groups[group])
+            if not any(local_lists):
                 return [], False, False
-            local_range, remote_range = ranges
-            local = (list(local_groups[0][local_range]),)
-            remote = (list(remote_groups[0][remote_range]),)
+            local, remote = tuple(local_lists), tuple(remote_lists)
             notif_msg = None if job.is_final else b""
 
         physical_local = self._logical_to_kernel_block_ids(

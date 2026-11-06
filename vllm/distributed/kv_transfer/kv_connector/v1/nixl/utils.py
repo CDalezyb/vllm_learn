@@ -11,7 +11,15 @@ import zmq
 
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import make_zmq_socket
-from vllm.v1.kv_cache_interface import KVCacheSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpec,
+    MambaSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+    is_full_attention_spec,
+    iter_layer_specs,
+)
 
 # Supported platforms and types of kv transfer buffer.
 # {device: tuple of supported kv buffer types}
@@ -65,3 +73,29 @@ _RANDOM_SUFFIX_RE = re.compile(r"-[0-9a-f]{8}$", re.IGNORECASE)
 def get_base_request_id(request_id: str) -> str:
     """Strip the per-request ``-<8 hex>`` randomization suffix, if present."""
     return _RANDOM_SUFFIX_RE.sub("", request_id)
+
+
+def chunked_push_group(kv_cache_config: KVCacheConfig) -> int | None:
+    """Index of the transfer group that chunked push sends chunk by chunk.
+
+    Its blocks (full attention or MLA) no longer change once computed, so each
+    prefill chunk sends the blocks it completed. The other transfer groups only
+    matter as of the end of prefill: their blocks are overwritten (Mamba state)
+    or recycled once outside the window (sliding window), so they go out once,
+    with the final chunk. Returns ``None`` unless exactly one group is of the
+    first kind and every other group is of the second.
+    """
+    groups = kv_cache_config.transfer_groups
+    chunked = [
+        index
+        for index, group in enumerate(groups)
+        if is_full_attention_spec(group.kv_cache_spec)
+    ]
+    if len(chunked) != 1 or not all(
+        isinstance(spec, (MambaSpec, SlidingWindowSpec))
+        for index, group in enumerate(groups)
+        if index != chunked[0]
+        for spec in iter_layer_specs(group.kv_cache_spec)
+    ):
+        return None
+    return chunked[0]

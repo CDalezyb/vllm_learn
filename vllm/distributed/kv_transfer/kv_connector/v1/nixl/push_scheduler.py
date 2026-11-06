@@ -40,9 +40,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlPushChunkJob,
     ReqId,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    chunked_push_group,
+)
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
-from vllm.v1.kv_cache_interface import is_full_attention_spec
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -121,8 +123,8 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         self._pinned_chunk_blocks: dict[ReqId, set[int]] = {}
         self._gpu_block_pool: BlockPool | None = None
 
+        self._chunked_group = chunked_push_group(kv_cache_config)
         if self._chunked_push:
-            transfer_groups = kv_cache_config.transfer_groups
             if vllm_config.kv_transfer_config.kv_role != "kv_producer":
                 self._chunked_push = False
             elif self.use_host_buffer:
@@ -134,12 +136,11 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
                 or vllm_config.parallel_config.decode_context_parallel_size != 1
             ):
                 raise ValueError("NIXL chunked push currently requires PCP=DCP=1")
-            elif len(transfer_groups) != 1 or not is_full_attention_spec(
-                transfer_groups[0].kv_cache_spec
-            ):
+            elif self._chunked_group is None:
                 raise ValueError(
                     "NIXL chunked push currently requires one full-attention "
-                    "transfer group"
+                    "transfer group, and only Mamba or sliding-window groups "
+                    "besides it"
                 )
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
@@ -440,7 +441,9 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
 
         block_state = scheduler_output.kv_connector_block_state
         assert block_state is not None
-        group = self.kv_cache_config.transfer_groups[0]
+        chunked = self._chunked_group
+        assert chunked is not None
+        group = self.kv_cache_config.transfer_groups[chunked]
         block_size = group.kv_cache_spec.block_size
         pool = self._gpu_block_pool
         assert pool is not None, (
@@ -476,17 +479,28 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             transfer_block_ids = self.kv_cache_config.select_transfer_block_ids(
                 all_block_ids
             )
-            assert len(transfer_block_ids) == 1
-            block_table = list(transfer_block_ids[0])
+            block_table = list(transfer_block_ids[chunked])
             total_blocks = cdiv(request.num_prompt_tokens, block_size)
             assert end_block <= len(block_table), (
                 f"NIXL chunk job for {req_id} needs {end_block} blocks, "
                 f"but the current table has {len(block_table)}"
             )
 
+            # The other groups only matter as of the end of prefill (state is
+            # overwritten, window blocks are recycled), so only the final job
+            # carries their blocks, clipped as for the whole-request push.
+            clipped = (
+                self.get_exchange_clipped_blocks(all_block_ids) if is_final else None
+            )
+            local_block_ids = tuple(
+                block_table[:end_block]
+                if group == chunked
+                else ([] if clipped is None else list(clipped[group]))
+                for group in range(len(transfer_block_ids))
+            )
             job = NixlPushChunkJob(
                 request_id=req_id,
-                local_block_ids=(block_table[:end_block],),
+                local_block_ids=local_block_ids,
                 start_block=0 if tracker.fallback else start_block,
                 end_block=end_block,
                 total_blocks=total_blocks,
@@ -494,11 +508,11 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             )
             meta.push_chunk_jobs.append(job)
 
-            # The final job also owns the full table so the worker can safely
-            # fall back to the stock monolithic WRITE after a late registration
-            # or an incompatible peer handshake.
+            # The final job also owns the full table and the other groups' blocks
+            # so the worker can safely fall back to the stock monolithic WRITE
+            # after a late registration or an incompatible peer handshake.
             referenced = (
-                block_table[:end_block]
+                [block_id for group in local_block_ids for block_id in group]
                 if is_final
                 else block_table[start_block:end_block]
             )

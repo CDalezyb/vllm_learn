@@ -447,6 +447,55 @@ class TestChunkedPushScheduler:
         output.num_scheduled_tokens = {}
         assert sched.build_connector_meta(output).push_chunk_cancellations == set()
 
+    @pytest.mark.parametrize("state", ["mamba", "sliding_window"])
+    def test_hybrid_final_job_carries_state_groups(self, state):
+        # Mamba state is overwritten and sliding-window blocks are recycled as
+        # the request runs, so only the final job carries (and pins) them.
+        vllm_config = create_vllm_config(
+            kv_connector="NixlPushConnector",
+            kv_role="kv_producer",
+            kv_connector_extra_config={"enable_chunked_push": True},
+        )
+        kv_cache_config = make_kv_cache_config(
+            block_size=16,
+            mamba_enabled=state == "mamba",
+            swa_enabled=state == "sliding_window",
+            num_blocks=8,
+        )
+        sched = NixlPushConnectorScheduler(
+            vllm_config, "test-prefill-engine", kv_cache_config
+        )
+        pool = BlockPool(num_gpu_blocks=8, enable_caching=False, hash_block_size=16)
+        attn_blocks = pool.get_new_blocks(3)
+        state_blocks = pool.get_new_blocks(1 if state == "mamba" else 3)
+        attn_ids = [block.block_id for block in attn_blocks]
+        state_ids = [block.block_id for block in state_blocks]
+        sched.bind_gpu_block_pool(pool)
+
+        request = create_request(num_tokens=40, block_size=16, do_remote_decode=True)
+        sched.update_state_after_alloc(
+            request,
+            KVCacheBlocks((attn_blocks, state_blocks)),
+            num_external_tokens=0,
+        )
+        output = SchedulerOutput.make_empty()
+        output.num_scheduled_tokens = {request.request_id: 32}
+        output.preempted_req_ids = set()
+        output.kv_connector_block_state = KVConnectorBlockState(
+            req_ids={request.request_id},
+            resolve_block_ids=lambda _: (attn_ids, state_ids),
+            boundary_state_offloads={},
+        )
+        (first_job,) = sched.build_connector_meta(output).push_chunk_jobs
+        assert first_job.local_block_ids == (attn_ids[:2], [])
+        assert [block.ref_cnt for block in state_blocks] == [1] * len(state_blocks)
+
+        request.num_computed_tokens = 32
+        output.num_scheduled_tokens = {request.request_id: 8}
+        (final_job,) = sched.build_connector_meta(output).push_chunk_jobs
+        assert final_job.local_block_ids == (attn_ids, state_ids)
+        assert [block.ref_cnt for block in state_blocks] == [2] * len(state_blocks)
+
 
 # ----------------------------------------------------------------- #
 #  Worker-side tests                                                 #
@@ -493,6 +542,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._next_chunk_transfer_id = 0
         w._completed_chunk_requests = set()
         w._chunk_lock = threading.Lock()
+        w._chunked_group = 0
 
         # Base worker fields touched by start_load_kv / _get_new_notifs.
         w._recving_metadata = {}
@@ -672,6 +722,33 @@ def test_chunk_job_queued_at_cancellation_is_not_sent():
 
     w._submit_chunk_job.assert_not_called()
     assert reports == ["req-p"]
+
+
+def test_hybrid_chunk_jobs_send_mamba_state_with_final_job():
+    w = _StubWriterWorker.fresh()
+    w._physical_blocks_per_logical_kv_block = 1
+    sent = []
+
+    def xfer(*, req_id, meta, notif_msg, track_request):
+        sent.append((meta.local_block_ids, meta.remote.block_ids))
+        return [object()]
+
+    w._xfer_blocks_for_req = xfer
+    reg_data = _registration_data("req-d", local_block_ids=([11, 12, 13], [19]))
+    for start, end, state in ((0, 2, []), (2, 3, [9])):
+        job = NixlPushChunkJob(
+            request_id="req-p",
+            local_block_ids=([1, 2, 3][:end], state),
+            start_block=start,
+            end_block=end,
+            total_blocks=3,
+            is_final=end == 3,
+        )
+        w._submit_chunk_job(job, reg_data, fallback=False)
+    assert sent == [
+        (([1, 2], []), ([11, 12], [])),
+        (([3], [9]), ([13], [19])),
+    ]
 
 
 class TestPushWriterRegSend:
