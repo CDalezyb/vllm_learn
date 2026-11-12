@@ -49,6 +49,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlConnectorWorker,
     NixlHandshakePayload,
     NixlKVConnectorStats,
+    NixlPushConnector,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     HeartbeatInfo,
@@ -3803,6 +3804,39 @@ def test_transfer_topology_unregister():
 
     # Idempotent: no error on double-unregister
     topo.unregister_remote_engine("remote-1")
+
+
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FakeNixlWrapper,
+)
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("preempted", [True, False])
+def test_chunked_push_timeout_blocks_execution(dist_init, preempted):
+    """An unsettled retirement must stop execution before KV blocks are reused."""
+    vllm_config = create_vllm_config(
+        kv_connector="NixlPushConnector",
+        kv_role="kv_producer",
+        kv_connector_extra_config={
+            "enable_chunked_push": True,
+            "kv_lease_duration": 0,
+        },
+    )
+    vllm_config.kv_transfer_config.kv_buffer_device = "cpu"
+    connector = NixlPushConnector(
+        vllm_config, KVConnectorRole.WORKER, make_kv_cache_config(block_size=16)
+    )
+    metadata = NixlConnectorMetadata()
+    if preempted:
+        metadata.push_chunk_preemptions.add("req-p")
+    else:
+        metadata.reqs_not_processed.add("req-p")
+
+    try:
+        with pytest.raises(RuntimeError, match="req-p.*refusing to reuse"):
+            connector.handle_preemptions(metadata)
+    finally:
+        connector.shutdown()
 
 
 @patch(

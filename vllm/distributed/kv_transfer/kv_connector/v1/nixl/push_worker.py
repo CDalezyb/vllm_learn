@@ -108,7 +108,7 @@ class _ChunkTask:
 
 @dataclass
 class _ChunkRetirement:
-    """Preempted and aborted requests whose chunk jobs are dropped. ``done``
+    """Preempted and aborted requests whose chunk jobs are dropped. `done`
     is set once none of their WRITEs is in flight."""
 
     preempted: set[ReqId]
@@ -351,11 +351,11 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         self._chunk_job_inbox.put(retirement)
         self._push_writer_wake.set()
         if not retirement.done.wait(self._lease_extension):
-            logger.error(
-                "NIXL chunk WRITEs of requests %s did not complete within %ds; "
-                "their blocks may be reused while still being read.",
-                retirement.preempted | retirement.aborted,
-                self._lease_extension,
+            raise RuntimeError(
+                "NIXL chunk WRITEs of requests "
+                f"{sorted(retirement.preempted | retirement.aborted)} "
+                f"did not complete within {self._lease_extension}s; "
+                "refusing to reuse their KV blocks."
             )
 
     # --- Writer thread ------------------------------------------------- #
@@ -596,7 +596,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         notify: bool,
     ) -> list[TransferHandle]:
         """WRITE the job's blocks that fall in D's uncached suffix, with the
-        request's completion notification if ``notify``."""
+        request's completion notification if `notify`."""
         # Keep the engine alive while it receives pushes, as _do_start_push_kv
         # does.
         self._engine_last_active[reg_data["decode_engine_id"]] = time.perf_counter()
@@ -635,7 +635,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         job: NixlPushChunkJob, num_remote_blocks: int
     ) -> tuple[slice, slice] | None:
         """Map a job's range onto D's uncached suffix: slices of the job's
-        ``block_ids`` and of D's block list."""
+        `block_ids` and of D's block list."""
         remote_start = job.total_blocks - num_remote_blocks
         start = max(job.start_block, remote_start)
         if start >= job.end_block:

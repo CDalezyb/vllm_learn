@@ -552,8 +552,8 @@ def _chunk_worker() -> _StubWriterWorker:
 
 
 def _publish(w: _StubWriterWorker, *jobs: NixlPushChunkJob, ready: bool = True):
-    """Publish jobs as ``wait_for_save`` does; their CUDA event reports
-    ``ready``."""
+    """Publish jobs as `wait_for_save` does; their CUDA event reports
+    `ready`."""
     meta = NixlConnectorMetadata()
     meta.push_chunk_jobs = list(jobs)
     with patch(
@@ -612,8 +612,8 @@ def test_handed_off_request_is_reported_once_it_finishes():
 def _fail_writes(w: _StubWriterWorker) -> None:
     """Make in-flight WRITEs report failure when polled."""
     w._log_failure = MagicMock()
-    w._handle_failed_transfer = (
-        lambda req_id, handle, failed: failed.add(req_id) or True
+    w._handle_failed_transfer = lambda req_id, handle, failed: (
+        failed.add(req_id) or True
     )
     w.nixl_wrapper.check_xfer_state.return_value = "ERR"
 
@@ -718,18 +718,6 @@ def test_request_preempted_during_its_handoff(handed_off):
     _publish(w, _chunk_job(0, 2))
     w._process_chunk_jobs()
     assert len(w.writes) == (1 if handed_off else 2)
-
-
-def test_preemption_stops_waiting_for_a_write_that_never_completes():
-    w = _chunk_worker()
-    w._lease_extension = 0
-    meta = NixlConnectorMetadata()
-    meta.push_chunk_preemptions = {"req-p"}
-    with patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker.logger"
-    ) as mock_logger:
-        w.handle_preemptions(meta)
-    mock_logger.error.assert_called_once()
 
 
 def test_evicted_request_drops_its_chunk_jobs():
