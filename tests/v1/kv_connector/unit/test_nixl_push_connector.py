@@ -609,20 +609,47 @@ def test_last_chunk_waits_for_earlier_writes_and_carries_notification():
     assert w.writes[1:] == [(([2],), ([101],), True)]
 
 
-def test_handed_off_request_is_reported_once_it_finishes():
+@pytest.mark.parametrize("last_write", ["done", "failed", "failed_submission"])
+def test_notified_request_is_not_pushed_again(last_write):
+    # D is notified at most once. A request whose notifying WRITE completed is
+    # reported as a whole-request push whose WRITEs completed; one whose
+    # notifying WRITE failed may have notified D anyway, so it is left to the
+    # lease, as a failed whole-request push is.
     w = _chunk_worker()
-    w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+    if last_write == "done":
+        w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+    elif last_write == "failed":
+        _fail_writes(w)
+    else:  # `transfer` raised and the handle was released
+        w._xfer_blocks_for_req = lambda req_id, meta, notify=True: (
+            w._send_failures.add(req_id) or []
+        )
     _publish(w, _chunk_job(0, 2))
     w._process_chunk_jobs()
     w._poll_chunk_transfers()
     assert "req-p" not in w._sending_transfers
 
-    # Reported with no further WRITE, as a whole-request push whose WRITEs
-    # completed.
     w._set_chunk_finished("req-p", ([1, 2],))
     w._process_chunk_handoffs()
-    assert w._sending_transfers["req-p"] == []
-    assert len(w.writes) == 1
+    assert w.start_push_calls == []
+    assert "req-p" not in w._push_finished_blocks
+    assert "req-p" not in w._chunk_states
+    # Reported with no further WRITE only if the notifying WRITE completed.
+    assert w._sending_transfers.get("req-p") == ([] if last_write == "done" else None)
+
+
+def test_job_that_raises_fails_only_its_request():
+    w = _chunk_worker()
+    w._pending_d_registrations["req-q"] = _registration_data(
+        "req-q", local_block_ids=((200,),)
+    )
+    # Raises KeyError for req-p's job.
+    w._chunk_path_supported = lambda job, reg_data: {"req-q": True}[job.request_id]
+    other = NixlPushChunkJob("req-q", [5], start_block=0, end_block=1, total_blocks=1)
+    _publish(w, _chunk_job(0, 2), other)
+    w._process_chunk_jobs()
+    assert w._chunk_states["req-p"].failed
+    assert w.writes == [(([5],), ([200],), True)]
 
 
 def _fail_writes(w: _StubWriterWorker) -> None:
@@ -728,22 +755,23 @@ def test_retired_request_settles_its_writes_and_drops_its_jobs(preempted):
         assert w.writes[1:] == [(([1, 2],), ([100, 101],), True)]
 
 
-@pytest.mark.parametrize("handed_off", [True, False])
-def test_request_preempted_during_its_handoff(handed_off):
+@pytest.mark.parametrize("last_write", ["DONE", "ERR"])
+def test_request_preempted_during_its_handoff(last_write):
     w = _chunk_worker()
     _fail_writes(w)
     w.nixl_wrapper.check_xfer_state.return_value = "PROC"
     _publish(w, _chunk_job(0, 2))
     w._process_chunk_jobs()
     settled = _retire(w, preempted=True)
-    w.nixl_wrapper.check_xfer_state.return_value = "DONE" if handed_off else "ERR"
+    w.nixl_wrapper.check_xfer_state.return_value = last_write
     w._poll_chunk_transfers()
     assert settled.is_set()
 
-    # Once handed off, the recomputed prompt is not pushed again.
+    # Once the notifying WRITE is submitted, even if it failed, the recomputed
+    # prompt is not pushed again.
     _publish(w, _chunk_job(0, 2))
     w._process_chunk_jobs()
-    assert len(w.writes) == (1 if handed_off else 2)
+    assert len(w.writes) == 1
 
 
 def test_untracked_abort_does_not_wait_for_the_writer():
