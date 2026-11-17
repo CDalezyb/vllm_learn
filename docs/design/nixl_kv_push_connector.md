@@ -46,10 +46,15 @@ sequenceDiagram
     DWorker->>DWriter: enqueue (req_id, reg_data) on _reg_send_inbox
     DWriter->>PWriter: NIXL send_notif PUSH_REG msgpack
 
+    note over PSched,PWriter: P side - push at the last prefill step
+    PSched->>PWorker: build_connector_meta -> meta.push_jobs
+    PWorker->>PWriter: wait_for_save, enqueue (req_id, blocks, event) on _prefill_inbox
+    PWriter->>PWriter: once the step's event completed, WRITE if PUSH_REG and handshake are ready
+
     note over PSched,PWriter: P side - prefill, stage finished blocks
     PSched->>PSched: request_finished, stash blocks
     PSched->>PWorker: build_connector_meta -> meta.push_finished_blocks
-    PWorker->>PWriter: enqueue (req_id, blocks) on _finished_blocks_inbox
+    PWorker->>PWriter: enqueue (req_id, blocks) on _prefill_inbox, skipped if pushed
 
     note over PWriter: P writer matches and WRITEs
     PWriter->>PWriter: get_new_notifs returns PUSH_REG, route via _handle_push_reg_notif
@@ -129,12 +134,48 @@ event:
 
 In addition to event-driven wakes, the writer self-polls at
 ``_PUSH_WRITER_POLL_INTERVAL_MS = 1.0`` ms while there are P-side
-finished blocks waiting for an unmatched ``PUSH_REG``.
+finished blocks waiting for an unmatched ``PUSH_REG``, pushes waiting for
+their step to complete on the device, or WRITEs in flight. With UCX, a WRITE
+progresses, and its completion notification reaches D, only when the initiator
+polls it; the engine thread polls it once per step, which can take hundreds of
+ms for long prefills.
 
 When a request completes on P (lease expires or the WRITE finishes),
 ``get_finished`` enqueues the request id onto ``_evict_finished_inbox``,
 which the writer drains to drop stale ``_push_finished_blocks`` /
 ``_pending_d_registrations`` and stop self-polling.
+
+## Pushing at the last prefill step
+
+P pushes a request in the step that completes its prompt (a push job), so
+its WRITE overlaps with the rest of that step's batch and the request's
+return to the proxy. P requests have `max_tokens=1`, so the prompt's blocks,
+and the Mamba, sliding-window and circular-buffer state, are final once that
+step's work on the device has completed: the async scheduler adds one
+placeholder token at that step and schedules no further step for the request.
+
+* The scheduler sends the request's blocks in `meta.push_jobs`,
+  clipped as when the request finishes; attention blocks past the prompt,
+  such as speculative lookahead blocks, are left out. `wait_for_save` records
+  an event once the step's model execution is enqueued.
+* Once the event has completed, the writer starts the WRITE if D's
+  registration has arrived and the P→D handshake has completed. Otherwise the
+  request is pushed when it finishes, as any request whose push has not
+  started, so that a push never waits while the request's blocks may still be
+  freed.
+* `request_finished` sets the lease and stages the blocks as for any request;
+  the writer does not push a request whose push already started, and drops
+  it from `_started_push_jobs` then. A WRITE that completes before the request
+  finishes is reported as `finished_sending` once it has.
+* A request with a push job that is preempted or aborted before it finishes
+  is sent in `meta.push_job_preemptions` / `meta.push_job_aborts`.
+  `handle_preemptions` waits until none of its WRITEs is in flight, so its
+  blocks are not reused while being read. A preempted request whose push has
+  not started yet is pushed again once recomputed; one whose push started is
+  not, so D is notified once.
+* Requests that decode after their prompt (`max_tokens` > 1), and models with
+  KV cache group types other than full attention, sliding window, Mamba and
+  circular buffer, are pushed when the request finishes.
 
 ## Writer-local matching tables
 
@@ -142,6 +183,8 @@ which the writer drains to drop stale ``_push_finished_blocks`` /
 |--------------------------------|------------------|------------------------------------------------------------------------|
 | `_pending_d_registrations`     | writer           | D registrations received from a remote D, waiting for P's blocks       |
 | `_push_finished_blocks`        | writer           | P blocks staged by the scheduler, waiting for a remote D registration  |
+| `_pending_push_tasks`          | writer           | Push tasks waiting for their step to complete                          |
+| `_started_push_jobs`           | writer           | Requests whose push started, not pushed again                          |
 
 Either side can arrive first. The writer matches in both directions:
 when a ``PUSH_REG`` arrives we look up ``_push_finished_blocks``, and

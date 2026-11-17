@@ -9,11 +9,14 @@ In push mode, scheduler-side responsibilities are:
   `_push_pending_registrations`. The D worker drains it from
   `meta.push_registrations` next step and sends a NIXL notification to the
   P worker (no scheduler-level networking).
-* P side (prefill): on `request_finished`, stash the finished block IDs
-  into `_finished_request_blocks` for the lease, and into
+* P side (prefill): in the step that completes a request's prompt, send its
+  block IDs in `meta.push_jobs` so the P worker pushes it then. On
+  `request_finished`, stash the finished block IDs into
+  `_finished_request_blocks` for the lease, and into
   `_newly_finished_push_blocks` so the P worker picks them up via
-  `meta.push_finished_blocks` and matches against any D registrations
-  it already received via NIXL notifications.
+  `meta.push_finished_blocks` and matches against any D registrations it
+  already received via NIXL notifications; the worker skips a request
+  whose push job started.
 * Both sides: `has_pending_push_work` keeps the engine main loop stepping
   while pushes are in flight. `update_connector_output` cleans up
   `_finished_request_blocks` once the WRITE completes.
@@ -39,6 +42,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqId,
 )
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    MambaSpec,
+    SlidingWindowSpec,
+    is_full_attention_spec,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -49,6 +59,10 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# Besides full attention, the KV cache group types that are final once the
+# prompt is computed; models with others are pushed when requests finish.
+_PUSH_JOB_SPEC_TYPES = (MambaSpec, SlidingWindowSpec, CircularBufferSpec)
 
 
 class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
@@ -88,6 +102,16 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         self._finished_request_blocks: dict[ReqId, BlockIds] = {}
         # P-side: newly finished blocks to ship to P workers on next step.
         self._newly_finished_push_blocks: dict[ReqId, BlockIds] = {}
+
+        # P-side: push requests in the step that completes their prompt.
+        self._push_jobs_enabled = all(
+            is_full_attention_spec(group.kv_cache_spec)
+            or isinstance(group.kv_cache_spec, _PUSH_JOB_SPEC_TYPES)
+            for group in kv_cache_config.transfer_groups
+        )
+        self._reqs_awaiting_push_job: dict[ReqId, Request] = {}
+        self._reqs_with_push_jobs: set[ReqId] = set()
+        self._push_job_aborts: set[ReqId] = set()
 
         # Soft watchdog timeout (seconds) for D-side registrations that
         # never receive a push completion. Defaults to the existing
@@ -146,6 +170,8 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # matches what the worker expects on the next step.
         if params.get("do_remote_decode"):
             self._reqs_in_batch.add(request.request_id)
+            if self._push_jobs_enabled:
+                self._reqs_awaiting_push_job[request.request_id] = request
 
         # P side with host-buffer offload: defer save to the worker.
         if self.use_host_buffer and params.get("do_remote_decode"):
@@ -249,10 +275,15 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         if not is_p_node:
             return False, None
 
+        self._reqs_awaiting_push_job.pop(request.request_id, None)
+        has_push_job = request.request_id in self._reqs_with_push_jobs
+        self._reqs_with_push_jobs.discard(request.request_id)
         if request.status not in (
             RequestStatus.FINISHED_LENGTH_CAPPED,
             RequestStatus.FINISHED_STOPPED,
         ):
+            if has_push_job:
+                self._push_job_aborts.add(request.request_id)
             self._reqs_not_processed.add(request.request_id)
             self._reqs_need_save.pop(request.request_id, None)
             return False, None
@@ -277,6 +308,10 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             # registrations (via NIXL notifications).
             self._finished_request_blocks[request.request_id] = block_ids
             self._newly_finished_push_blocks[request.request_id] = block_ids
+        elif has_push_job:
+            # Its blocks were freed after a preemption; the worker drops it.
+            self._push_job_aborts.add(request.request_id)
+            self._reqs_not_processed.add(request.request_id)
 
         return delay_free_blocks, dict(
             do_remote_prefill=True,
@@ -337,7 +372,51 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             meta.push_finished_blocks = dict(self._newly_finished_push_blocks)
             self._newly_finished_push_blocks.clear()
 
+        if self._push_jobs_enabled:
+            self._build_push_jobs(meta, scheduler_output)
         return meta
+
+    def _build_push_jobs(
+        self, meta: NixlConnectorMetadata, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Add push jobs for the requests whose prompt this step completes, and
+        report requests with push jobs preempted or aborted since the last
+        step."""
+        for req_id in scheduler_output.preempted_req_ids or ():
+            if req_id in self._reqs_with_push_jobs:
+                meta.push_job_preemptions.add(req_id)
+        meta.push_job_aborts, self._push_job_aborts = (
+            self._push_job_aborts,
+            set(),
+        )
+
+        block_state = scheduler_output.kv_connector_block_state
+        for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+            request = self._reqs_awaiting_push_job.get(req_id)
+            # A request that decodes after its prompt is pushed when it finishes.
+            if (
+                request is None
+                or request.max_tokens != 1
+                or request.num_computed_tokens + num_tokens < request.num_prompt_tokens
+            ):
+                continue
+            assert block_state is not None
+            block_ids = block_state.get_block_ids(req_id)
+            assert block_ids is not None
+            # Attention blocks past the prompt (speculative lookahead) are not
+            # sent; state groups are clipped as when the request finishes.
+            block_ids = tuple(
+                ids[: cdiv(request.num_prompt_tokens, group.kv_cache_spec.block_size)]
+                if is_full_attention_spec(group.kv_cache_spec)
+                or isinstance(group.kv_cache_spec, SlidingWindowSpec)
+                else ids
+                for group, ids in zip(
+                    self.kv_cache_config.kv_cache_groups, block_ids, strict=True
+                )
+            )
+            meta.push_jobs[req_id] = self.get_exchange_clipped_blocks(block_ids)
+            del self._reqs_awaiting_push_job[req_id]
+            self._reqs_with_push_jobs.add(req_id)
 
     def has_pending_push_work(self) -> bool:
         # Keep the engine main loop alive while we have:

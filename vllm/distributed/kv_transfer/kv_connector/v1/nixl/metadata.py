@@ -293,6 +293,12 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # Push mode (P side): newly finished request blocks to be matched
         # against pending D registrations on the P worker.
         self.push_finished_blocks: dict[ReqId, BlockIds] = {}
+        # Push mode (P side): blocks of requests whose prompt this step
+        # completes, and requests with push jobs preempted or aborted since the
+        # last step, whose WRITEs settle before their blocks are reused.
+        self.push_jobs: dict[ReqId, BlockIds] = {}
+        self.push_job_preemptions: set[ReqId] = set()
+        self.push_job_aborts: set[ReqId] = set()
 
     def _add_new_req(
         self,
