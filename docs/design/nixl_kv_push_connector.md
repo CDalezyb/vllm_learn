@@ -17,6 +17,47 @@ Explicit `NixlPullConnector` and `NixlPushConnector` names ignore this option.
 Under `MultiConnector`, set `transfer_mode` in the NIXL child's
 `kv_connector_extra_config`.
 
+## Early push
+
+`NixlPushConnector` can send a request's KV blocks in the prefill step that
+computes the end of its prompt, instead of after the request finishes. It is
+enabled on the producer by `enable_early_push` in `kv_connector_extra_config`
+(see [NIXL connector usage](../features/nixl_connector_usage.md)) and is off by
+default. Early push is used only in the configurations it is tested in: a
+device KV buffer, PP1, PCP1, DCP1, one transferable full-attention cache group,
+and P and D with the same TP, for requests with `max_tokens=1`. In other
+configurations a warning is logged and requests are pushed when they finish.
+
+Early push changes only when blocks are written. Block lifetimes are those of
+the push at finish: a running request owns its blocks, preemption and abort
+release them, and a finished request holds them under the KV lease
+(`kv_lease_duration`), which D's heartbeats extend.
+
+* In the step that computes the end of the prompt, the scheduler hands the
+  prompt's blocks to the worker as a push job. The writer writes them to D,
+  without a notification, once the step's event completes and D has
+  registered.
+* D decodes once the normal completion notification arrives, so it must follow
+  all of the request's data. The writer sends it with `send_notif` once every
+  WRITE of the job is `DONE`. A notification attached to a WRITE would be sent
+  when the UCX endpoint flush completes, which some UCX versions report before
+  all of an SGL WRITE's data is posted.
+* When the request finishes, the existing push path reports it once D has been
+  notified. If the job was not written and D was not notified (D not
+  handshaked yet, an incompatible peer or a failed WRITE), the request is
+  pushed as it finishes instead; if D has not registered yet, the request
+  waits for its registration. D is notified at most once: if sending the
+  notification fails, it may still have reached D, so the request is left to
+  the lease, as a failed push is.
+* When a request with a push job is preempted or aborted, `handle_preemptions`
+  drops the job if it is still queued and waits for its submitted WRITEs
+  before the blocks can be reused. A preempted request is pushed again once
+  recomputed, unless D was already notified, which async scheduling allows
+  before the request finishes.
+
+D only reads its blocks after the completion notification, so the D-side
+scheduler and decode admission path are unchanged.
+
 This document describes the threading, queues, and scheduling
 interactions specific to the push design. The pull-mode design is
 unchanged; the push connector reuses the same handshake, NIXL agent
@@ -49,7 +90,7 @@ sequenceDiagram
     note over PSched,PWriter: P side - prefill, stage finished blocks
     PSched->>PSched: request_finished, stash blocks
     PSched->>PWorker: build_connector_meta -> meta.push_finished_blocks
-    PWorker->>PWriter: enqueue (req_id, blocks) on _finished_blocks_inbox
+    PWorker->>PWriter: enqueue (req_id, blocks) on _prefill_inbox
 
     note over PWriter: P writer matches and WRITEs
     PWriter->>PWriter: get_new_notifs returns PUSH_REG, route via _handle_push_reg_notif

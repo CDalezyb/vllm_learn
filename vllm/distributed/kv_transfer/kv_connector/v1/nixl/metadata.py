@@ -272,6 +272,15 @@ class ReqMeta:
     covered_sub_blocks: list[range] | None = None
 
 
+@dataclass(frozen=True)
+class NixlPushJob:
+    """The prompt blocks of a request whose prompt is computed in this step,
+    with their ids in its full-attention block table."""
+
+    request_id: ReqId
+    block_ids: list[int]
+
+
 class NixlConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
@@ -293,6 +302,13 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # Push mode (P side): newly finished request blocks to be matched
         # against pending D registrations on the P worker.
         self.push_finished_blocks: dict[ReqId, BlockIds] = {}
+        # Push mode (P side): the prompt blocks to send before the request
+        # finishes, and the requests with a push job preempted or aborted
+        # since the last step, whose WRITEs are settled before their blocks
+        # are reused.
+        self.push_jobs: list[NixlPushJob] = []
+        self.push_job_preemptions: set[ReqId] = set()
+        self.push_job_aborts: set[ReqId] = set()
 
     def _add_new_req(
         self,

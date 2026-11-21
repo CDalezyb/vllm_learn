@@ -43,9 +43,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
     NixlAgentMetadata,
     NixlConnectorMetadata,
+    NixlPushJob,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_scheduler import (
+    NixlPushConnectorScheduler,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
     NixlPushConnectorWorker,
+    _PushRetirement,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlKVConnectorStats,
@@ -57,12 +62,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_base_request_id,
 )
+from vllm.v1.core.sched.output import KVConnectorBlockState, SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.outputs import KVConnectorOutput
 
 from .utils import (
     create_request,
+    create_vllm_config,
     expand_strided_descs,
+    make_kv_cache_config,
     make_nixl_push_scheduler,
     region_pairs_by_index,
     remote_stage,
@@ -327,6 +335,92 @@ class TestPushScheduler:
         assert d_req.request_id not in meta.push_registrations
 
 
+class TestEarlyPushScheduler:
+    @staticmethod
+    def _scheduler_with_request():
+        """An early-push scheduler and a 40-token request on blocks 1-3 of 16
+        tokens, with the scheduler output that resolves the request's blocks."""
+        vllm_config = create_vllm_config(
+            kv_connector="NixlPushConnector",
+            kv_role="kv_producer",
+            kv_connector_extra_config={"enable_early_push": True},
+        )
+        kv_cache_config = make_kv_cache_config(block_size=16, num_blocks=8)
+        sched = NixlPushConnectorScheduler(
+            vllm_config, "test-prefill-engine", kv_cache_config
+        )
+        request = create_request(num_tokens=40, block_size=16, do_remote_decode=True)
+        sched.update_state_after_alloc(request, _BlocksMock(([1, 2, 3],)), 0)
+
+        output = SchedulerOutput.make_empty()
+        output.preempted_req_ids = set()
+        output.kv_connector_block_state = KVConnectorBlockState(
+            req_ids={request.request_id},
+            resolve_block_ids=lambda _: ([1, 2, 3, 4],),
+            boundary_state_offloads={},
+        )
+        return sched, request, output
+
+    def test_job_covers_the_prompt_in_the_step_that_completes_it(self):
+        sched, request, output = self._scheduler_with_request()
+
+        output.num_scheduled_tokens = {request.request_id: 32}
+        assert sched.build_connector_meta(output).push_jobs == []
+
+        request.num_computed_tokens = 32
+        output.num_scheduled_tokens = {request.request_id: 8}
+        (job,) = sched.build_connector_meta(output).push_jobs
+        # The prompt's blocks only, its partial last block included.
+        assert (job.request_id, job.block_ids) == (request.request_id, [1, 2, 3])
+
+        request.num_computed_tokens = 40
+        output.num_scheduled_tokens = {request.request_id: 1}
+        assert sched.build_connector_meta(output).push_jobs == []
+
+    def test_request_generating_more_tokens_is_pushed_when_it_finishes(self):
+        sched, _, output = self._scheduler_with_request()
+        request = create_request(num_tokens=40, block_size=16, do_remote_decode=True)
+        request.max_tokens = 4
+        sched.update_state_after_alloc(request, _BlocksMock(([4, 5, 6],)), 0)
+
+        output.num_scheduled_tokens = {request.request_id: 40}
+        assert sched.build_connector_meta(output).push_jobs == []
+
+    def test_preempted_request_is_pushed_again(self):
+        sched, request, output = self._scheduler_with_request()
+        output.num_scheduled_tokens = {request.request_id: 40}
+        sched.build_connector_meta(output)
+
+        output.preempted_req_ids = {request.request_id}
+        output.num_scheduled_tokens = {}
+        meta = sched.build_connector_meta(output)
+        assert meta.push_job_preemptions == {request.request_id}
+        assert meta.push_jobs == []
+
+        # Pushed again once recomputed.
+        sched.update_state_after_alloc(request, _BlocksMock(([1, 2, 3],)), 0)
+        output.preempted_req_ids = set()
+        output.num_scheduled_tokens = {request.request_id: 40}
+        (job,) = sched.build_connector_meta(output).push_jobs
+        assert job.block_ids == [1, 2, 3]
+
+    @pytest.mark.parametrize("tracked", [True, False])
+    def test_only_tracked_aborts_reach_the_worker(self, tracked):
+        from vllm.v1.request import RequestStatus
+
+        sched, request, output = self._scheduler_with_request()
+        if not tracked:  # e.g. the scheduler pushes requests when they finish
+            sched._push_trackers.clear()
+        request.status = RequestStatus.FINISHED_ABORTED
+        sched.request_finished(request, ([1, 2, 3],))
+
+        output.num_scheduled_tokens = {}
+        meta = sched.build_connector_meta(output)
+        assert meta.push_job_aborts == ({request.request_id} if tracked else set())
+        assert request.request_id in meta.reqs_not_processed
+        assert sched.build_connector_meta(output).push_job_aborts == set()
+
+
 # ----------------------------------------------------------------- #
 #  Worker-side tests                                                 #
 # ----------------------------------------------------------------- #
@@ -352,13 +446,20 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._push_finished_blocks = {}
         w._pending_d_registrations = {}
         w._reg_send_inbox = queue.Queue()
-        w._finished_blocks_inbox = queue.Queue()
+        w._prefill_inbox = queue.Queue()
         w._pending_completion_notifs = queue.Queue()
         w._evict_finished_inbox = queue.Queue()
         w._deferred_push_inbox = queue.Queue()
         w._push_writer_wake = threading.Event()
         w._push_writer_stop = threading.Event()
         w._push_writer_thread = None
+        w._early_push = False
+        w._push_deferred = []
+        w._push_states = {}
+        w._push_transfers = {}
+        w._push_transfer_tasks = {}
+        w._next_push_transfer_id = 0
+        w._push_retirements = []
 
         # Base worker fields touched by start_load_kv / _get_new_notifs.
         w._recving_metadata = {}
@@ -438,6 +539,309 @@ def _registration_data(
         "remote_port": remote_port,
         "remote_tp_size": remote_tp_size,
     }
+
+
+def _push_worker() -> _StubWriterWorker:
+    """An early-push worker for request "req-p", whose D side "req-d" has
+    registered blocks 100 and 101 and is handshaked. WRITEs are recorded as
+    (local blocks, remote blocks, notify), and completion notifications as
+    D's request id."""
+    w = _StubWriterWorker.fresh()
+    w._early_push = True
+    w._pending_d_registrations["req-p"] = _registration_data(
+        "req-d", local_block_ids=((100, 101),)
+    )
+    w._ensure_handshake = lambda *a, **k: None
+    w._push_path_supported = lambda reg_data: True
+    w._logical_to_kernel_block_ids = lambda blocks, ratio: blocks
+    w.nixl_wrapper = MagicMock()
+    w.xfer_stats = MagicMock()
+    w._lease_extension = 20
+    w.writes = []
+
+    def xfer(req_id, meta, *, notify=True):
+        w.writes.append((meta.local_block_ids, meta.remote.block_ids, notify))
+        return [len(w.writes)]
+
+    w._xfer_blocks_for_req = xfer
+    w.notifs = []
+    w._send_completion_notif = lambda reg_data: w.notifs.append(reg_data["request_id"])
+    return w
+
+
+def _push_job(request_id: str = "req-p") -> NixlPushJob:
+    return NixlPushJob(request_id=request_id, block_ids=[1, 2])
+
+
+def _publish(w: _StubWriterWorker, *jobs: NixlPushJob, ready: bool = True):
+    """Publish jobs as `wait_for_save` does, and have the writer take them;
+    their event reports `ready`."""
+    meta = NixlConnectorMetadata()
+    meta.push_jobs = list(jobs)
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker.torch.Event"
+    ) as event:
+        event.return_value.query.return_value = ready
+        w.finish_push_step(meta)
+    w._take_prefill_inbox()
+
+
+def _run_writer_pass(w: _StubWriterWorker) -> None:
+    """The push job steps of one writer pass."""
+    w._process_push_jobs()
+    w._poll_push_transfers()
+    w._notify_pushed_requests()
+    w._process_push_handoffs()
+
+
+def _run_writer_until_idle(w: _StubWriterWorker) -> None:
+    """Run the writer thread until it has no queued or deferred push jobs."""
+    t = threading.Thread(target=w._push_writer_loop, daemon=True)
+    t.start()
+    try:
+        deadline = time.perf_counter() + 2.0
+        while (
+            w._push_deferred or not w._prefill_inbox.empty()
+        ) and time.perf_counter() < deadline:
+            time.sleep(0.01)
+    finally:
+        w._push_writer_stop.set()
+        w._push_writer_wake.set()
+        t.join(timeout=2)
+
+
+def _fail_writes(w: _StubWriterWorker) -> None:
+    """Make in-flight WRITEs report failure when polled."""
+    w._log_failure = MagicMock()
+    w._handle_failed_transfer = lambda req_id, handle, failed: (
+        failed.add(req_id) or True
+    )
+    w.nixl_wrapper.check_xfer_state.return_value = "ERR"
+
+
+def _retire(w: _StubWriterWorker, preempted: bool) -> threading.Event:
+    """Hand the writer what handle_preemptions sends for "req-p" when it is
+    preempted or aborted; the event is set once its WRITEs have settled."""
+    retirement = _PushRetirement(
+        preempted={"req-p"} if preempted else set(),
+        aborted=set() if preempted else {"req-p"},
+    )
+    w._prefill_inbox.put(retirement)
+    w._take_prefill_inbox()
+    w._process_push_jobs()
+    w._poll_push_transfers()
+    return retirement.done
+
+
+def test_d_is_notified_once_the_job_writes_are_done():
+    w = _push_worker()
+    w.nixl_wrapper.check_xfer_state.return_value = "PROC"
+    _publish(w, _push_job())
+    _run_writer_pass(w)
+    # The prompt goes to D's registered blocks, without a notification.
+    assert w.writes == [(([1, 2],), ((100, 101),), False)]
+    assert "decode-engine" in w._engine_last_active
+    assert w.notifs == []
+
+    w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+    _run_writer_pass(w)
+    _run_writer_pass(w)
+    assert w.notifs == ["req-d"]
+
+
+def test_job_waits_for_its_event():
+    w = _push_worker()
+    w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+    _publish(w, _push_job(), ready=False)
+    _run_writer_pass(w)
+    assert w.writes == []
+
+    w._push_deferred[0].event.query.return_value = True
+    _run_writer_pass(w)
+    assert len(w.writes) == 1
+    assert w.notifs == ["req-d"]
+
+
+def test_completion_notif_goes_to_each_d_rank_written():
+    w = _StubWriterWorker.fresh()
+    w.nixl_wrapper = MagicMock()
+    w.world_size = 2
+    w._remote_agents["decode-engine"] = {(0, 0): "agent-0", (0, 1): "agent-1"}
+    w.tp_mappings = {"decode-engine": MagicMock(all_source_ranks=[1])}
+    w._single_remote_stage = lambda engine_id: MagicMock(pp_rank=0)
+    w._send_completion_notif(_registration_data("req-d"))
+    w.nixl_wrapper.send_notif.assert_called_once_with("agent-1", notif_msg=b"req-d:2")
+
+
+@pytest.mark.parametrize("notification", ["sent", "failed"])
+def test_notified_request_is_not_pushed_again(notification):
+    # D is notified at most once. A request whose notification was sent is
+    # reported as a push whose WRITEs completed; one whose notification
+    # raised may have notified D anyway, so it is left to the lease, as a
+    # failed push is.
+    w = _push_worker()
+    w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+    if notification == "failed":
+        w._send_completion_notif = MagicMock(side_effect=RuntimeError("send"))
+    _publish(w, _push_job())
+    _run_writer_pass(w)
+    assert "req-p" not in w._sending_transfers
+
+    w._set_push_finished("req-p", ([1, 2],))
+    w._process_push_handoffs()
+    assert w.start_push_calls == []
+    assert "req-p" not in w._push_finished_blocks
+    assert "req-p" not in w._push_states
+    assert w._sending_transfers.get("req-p") == ([] if notification == "sent" else None)
+
+
+def test_job_that_raises_fails_only_its_request():
+    w = _push_worker()
+    w._pending_d_registrations["req-q"] = _registration_data(
+        "req-q", local_block_ids=((200,),)
+    )
+    # Raises KeyError for req-p's job.
+    w._push_path_supported = lambda reg_data: {"req-q": True}[reg_data["request_id"]]
+    _publish(w, _push_job(), NixlPushJob("req-q", [5]))
+    w._process_push_jobs()
+    assert w._push_states["req-p"].failed
+    assert w.writes == [(([5],), ((200,),), False)]
+
+
+@pytest.mark.parametrize(
+    "cause",
+    ["failed_write", "failed_submission", "incompatible_peer", "no_handshake"],
+)
+def test_request_whose_job_was_not_written_is_pushed_as_it_finishes(cause):
+    w = _push_worker()
+    if cause == "failed_write":
+        _fail_writes(w)
+    elif cause == "failed_submission":  # `transfer` raised, handle released
+        w._xfer_blocks_for_req = lambda req_id, meta, notify=True: (
+            w._send_failures.add(req_id) or []
+        )
+    elif cause == "incompatible_peer":  # e.g. a decode peer with a different TP
+        w._push_path_supported = lambda reg_data: False
+    else:  # D is not handshaked yet
+        w._ensure_handshake = lambda *a, **k: Future()
+    _publish(w, _push_job())
+    _run_writer_pass(w)
+    assert len(w.writes) == (1 if cause == "failed_write" else 0)
+    assert w.notifs == []
+
+    w._set_push_finished("req-p", ([1, 2],))
+    w._process_push_handoffs()
+    assert w.start_push_calls == [
+        ("req-p", ([1, 2],), _registration_data("req-d", local_block_ids=((100, 101),)))
+    ]
+
+
+def test_finished_request_without_registration_waits_for_it():
+    w = _push_worker()
+    w._pending_d_registrations.clear()
+    _publish(w, _push_job())
+    w._process_push_jobs()
+    w._set_push_finished("req-p", ([1, 2],))
+    w._process_push_handoffs()
+    assert w._push_finished_blocks == {"req-p": ([1, 2],)}
+
+    w._process_push_jobs()
+    assert w._push_deferred == []
+    assert w.writes == []
+
+
+def test_request_finishing_with_its_job_queued_is_not_pushed_again():
+    # The writer takes the push job and the finished request in one pass.
+    w = _push_worker()
+    meta = NixlConnectorMetadata()
+    meta.push_jobs = [_push_job()]
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker.torch.Event"
+    ) as event:
+        event.return_value.query.return_value = True
+        w.finish_push_step(meta)
+    w._prefill_inbox.put(("req-p", ([1, 2],)))  # as start_load_kv does
+
+    w._take_prefill_inbox()
+    assert w.start_push_calls == []
+    assert w._push_states["req-p"].finished_blocks == ([1, 2],)
+
+
+@pytest.mark.parametrize("preempted", [True, False])
+def test_retired_request_settles_its_writes_and_drops_its_job(preempted):
+    w = _push_worker()
+    w.nixl_wrapper.check_xfer_state.return_value = "PROC"
+    _publish(w, _push_job())
+    w._process_push_jobs()
+
+    # The wait lasts until the WRITE no longer reads the blocks.
+    settled = _retire(w, preempted)
+    assert not settled.is_set()
+    w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+    w._poll_push_transfers()
+    assert settled.is_set()
+    assert len(w.writes) == 1
+
+
+def test_queued_job_of_a_retired_request_is_dropped():
+    w = _push_worker()
+    _publish(w, _push_job(), ready=False)
+    assert _retire(w, preempted=False).is_set()
+    assert w._push_deferred == []
+    assert w.writes == []
+
+
+@pytest.mark.parametrize("notified", [False, True])
+def test_preempted_request_is_pushed_again_unless_d_was_notified(notified):
+    w = _push_worker()
+    w.nixl_wrapper.check_xfer_state.return_value = "DONE" if notified else "PROC"
+    _publish(w, _push_job())
+    _run_writer_pass(w)
+    settled = _retire(w, preempted=True)
+    w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+    _run_writer_pass(w)
+    assert settled.is_set()
+    # D is notified only for a computation whose WRITEs all completed before
+    # the preemption, and not before the recomputed prompt is written.
+    assert w.notifs == (["req-d"] if notified else [])
+
+    # D may already be decoding once notified, so the recomputed prompt is
+    # pushed again only if it was not.
+    _publish(w, _push_job())
+    _run_writer_pass(w)
+    assert len(w.writes) == (1 if notified else 2)
+    assert w.notifs == ["req-d"]
+
+
+def test_request_aborted_after_a_preemption_drops_its_state():
+    w = _push_worker()
+    w.nixl_wrapper.check_xfer_state.return_value = "PROC"
+    _publish(w, _push_job())
+    _run_writer_pass(w)
+    assert not _retire(w, preempted=True).is_set()
+    w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+    _run_writer_pass(w)
+    # Kept, with D's registration, for the recomputed prompt.
+    assert w._push_states["req-p"].reg_data is not None
+
+    assert _retire(w, preempted=False).is_set()
+    assert "req-p" not in w._push_states
+    assert w.notifs == []
+
+
+def test_evicted_request_drops_its_job():
+    # Its lease expired, e.g. because D never registered.
+    w = _push_worker()
+    w._pending_d_registrations.clear()
+    w.nixl_wrapper.get_new_notifs.return_value = {}
+    _publish(w, _push_job())
+    w._process_push_jobs()
+    w._evict_finished_inbox.put("req-p")
+
+    _run_writer_until_idle(w)
+    assert w._push_deferred == []
+    assert "req-p" not in w._push_states
+    assert w.writes == []
 
 
 class TestPushWriterRegSend:
@@ -597,26 +1001,16 @@ class TestPushWriterMatching:
 
 
 class TestPushWriterStartLoadKv:
-    def test_finished_blocks_inbox_matches_stashed_registration(self):
+    def test_prefill_inbox_matches_stashed_registration(self):
         """Run the writer-loop's finished-blocks drain against a
         pre-populated _pending_d_registrations entry."""
         w = _StubWriterWorker.fresh()
         w._pending_d_registrations["req-C"] = _registration_data("req-C")
 
         # Simulate start_load_kv enqueuing finished blocks.
-        w._finished_blocks_inbox.put(("req-C", ([10, 11, 12],)))
+        w._prefill_inbox.put(("req-C", ([10, 11, 12],)))
 
-        # Drain like the writer loop does.
-        while True:
-            try:
-                rid, blocks = w._finished_blocks_inbox.get_nowait()
-            except queue.Empty:
-                break
-            matched = w._pop_matching_registration(rid)
-            if matched is not None:
-                w._do_start_push_kv(rid, blocks, matched)
-            else:
-                w._push_finished_blocks[rid] = blocks
+        w._take_prefill_inbox()
 
         assert len(w.start_push_calls) == 1
         assert w.start_push_calls[0][0] == "req-C"
@@ -644,7 +1038,7 @@ class TestPushWriterStartLoadKv:
 
         # Things are queued for the writer; nothing fires yet.
         assert w._reg_send_inbox.qsize() == 1
-        assert w._finished_blocks_inbox.qsize() == 1
+        assert w._prefill_inbox.qsize() == 1
         assert w._push_writer_wake.is_set()
         assert w.start_push_calls == []
 
@@ -662,7 +1056,7 @@ class TestPushWriterStartLoadKv:
 
         w.start_load_kv(meta)
 
-        assert w._finished_blocks_inbox.empty() is (not sharded)
+        assert w._prefill_inbox.empty() is (not sharded)
         assert ("req" in w._reqs_to_process) is sharded
         assert ("req" in w._reqs_to_send) is sharded
         assert w._push_writer_wake.is_set() is sharded
@@ -1371,7 +1765,7 @@ class TestPushWriterNegative:
         w.start_load_kv(meta)
 
         assert w._reg_send_inbox.qsize() == 0
-        assert w._finished_blocks_inbox.qsize() == 0
+        assert w._prefill_inbox.qsize() == 0
         # Wake should NOT be set if there was nothing to push.
         assert not w._push_writer_wake.is_set()
 

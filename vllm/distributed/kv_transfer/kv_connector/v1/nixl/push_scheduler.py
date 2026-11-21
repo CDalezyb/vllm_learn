@@ -25,6 +25,7 @@ been registered but not fulfilled within a configurable timeout.
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
@@ -36,9 +37,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
+    NixlPushJob,
     ReqId,
 )
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -49,6 +53,13 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _PushJobTracker:
+    request: Request
+    # The push job of the request's current computation went to the worker.
+    pushed: bool = False
 
 
 class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
@@ -100,6 +111,33 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             )
         )
 
+        extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self._early_push = bool(extra_config.get("enable_early_push", False))
+        self._push_trackers: dict[ReqId, _PushJobTracker] = {}
+        self._push_job_aborts: set[ReqId] = set()
+
+        if self._early_push:
+            parallel_config = vllm_config.parallel_config
+            transfer_groups = kv_cache_config.transfer_groups
+            if vllm_config.kv_transfer_config.kv_role != "kv_producer":
+                self._early_push = False
+            elif (
+                self.use_host_buffer
+                or parallel_config.pipeline_parallel_size != 1
+                or parallel_config.prefill_context_parallel_size != 1
+                or parallel_config.decode_context_parallel_size != 1
+                or len(transfer_groups) != 1
+                or not issubclass(transfer_groups[0].manager_cls, FullAttentionManager)
+            ):
+                # Early push is used only in the configurations it is tested
+                # in; the others push requests when they finish.
+                logger.warning(
+                    "NIXL early push needs a device KV buffer, PP=1, PCP=1, "
+                    "DCP=1 and one full-attention KV cache group. Pushing "
+                    "requests when they finish."
+                )
+                self._early_push = False
+
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int, bool]:
@@ -146,6 +184,12 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # matches what the worker expects on the next step.
         if params.get("do_remote_decode"):
             self._reqs_in_batch.add(request.request_id)
+            if self._early_push and request.max_tokens == 1:
+                # D is notified once the prompt is pushed, so only requests
+                # that finish with the prompt are pushed early; the others are
+                # pushed when they finish. A preempted request is tracked
+                # again once its blocks are allocated again.
+                self._push_trackers[request.request_id] = _PushJobTracker(request)
 
         # P side with host-buffer offload: defer save to the worker.
         if self.use_host_buffer and params.get("do_remote_decode"):
@@ -249,10 +293,16 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         if not is_p_node:
             return False, None
 
+        tracked = (
+            self._early_push
+            and self._push_trackers.pop(request.request_id, None) is not None
+        )
         if request.status not in (
             RequestStatus.FINISHED_LENGTH_CAPPED,
             RequestStatus.FINISHED_STOPPED,
         ):
+            if tracked:
+                self._push_job_aborts.add(request.request_id)
             self._reqs_not_processed.add(request.request_id)
             self._reqs_need_save.pop(request.request_id, None)
             return False, None
@@ -300,6 +350,9 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         meta = super().build_connector_meta(scheduler_output)
         assert isinstance(meta, NixlConnectorMetadata)
 
+        if self._early_push:
+            self._build_push_jobs(meta, scheduler_output)
+
         # Watchdog: any D-side registration whose deadline has passed without
         # a corresponding push completion is treated as failed and cleaned up.
         # The corresponding request is already tracked via _reqs_need_recv;
@@ -338,6 +391,47 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             self._newly_finished_push_blocks.clear()
 
         return meta
+
+    def _build_push_jobs(
+        self,
+        meta: NixlConnectorMetadata,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        for req_id in scheduler_output.preempted_req_ids or ():
+            if req_id in self._push_trackers:
+                meta.push_job_preemptions.add(req_id)
+        meta.push_job_aborts, self._push_job_aborts = self._push_job_aborts, set()
+
+        block_state = scheduler_output.kv_connector_block_state
+        assert block_state is not None
+        block_size = self.kv_cache_config.transfer_groups[0].block_size
+
+        for (
+            req_id,
+            num_scheduled_tokens,
+        ) in scheduler_output.num_scheduled_tokens.items():
+            tracker = self._push_trackers.get(req_id)
+            if tracker is None or tracker.pushed:
+                continue
+            request = tracker.request
+            if (
+                request.num_computed_tokens + num_scheduled_tokens
+                < request.num_prompt_tokens
+            ):
+                continue
+            all_block_ids = block_state.get_block_ids(req_id)
+            assert all_block_ids is not None
+            transfer_block_ids = self.kv_cache_config.select_transfer_block_ids(
+                all_block_ids
+            )
+            num_blocks = cdiv(request.num_prompt_tokens, block_size)
+            meta.push_jobs.append(
+                NixlPushJob(
+                    request_id=req_id,
+                    block_ids=list(transfer_block_ids[0][:num_blocks]),
+                )
+            )
+            tracker.pushed = True
 
     def has_pending_push_work(self) -> bool:
         # Keep the engine main loop alive while we have:
