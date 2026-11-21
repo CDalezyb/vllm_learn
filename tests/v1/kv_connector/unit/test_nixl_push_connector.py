@@ -796,7 +796,7 @@ def _eviction_worker(engine_ttl: float) -> NixlPushConnectorWorker:
     w.transfer_topo = None
     w._logical_to_kernel_block_ids = lambda blocks, ratio: blocks
     w.writes = []
-    w._xfer_blocks_for_req = lambda req_id, meta: w.writes.append(req_id)
+    w._xfer_blocks_for_req = lambda req_id, meta, notify=True: w.writes.append(req_id)
     return w
 
 
@@ -814,6 +814,16 @@ def test_active_push_refreshes_engine_last_active():
 
     assert w._engine_last_active["decode-engine"] > stale
     assert w.writes == ["req"]
+
+
+def test_whole_push_publishes_its_write_handles():
+    w = _eviction_worker(engine_ttl=3600.0)
+    w._remote_agents["decode-engine"] = {(0, 0): "agent-decode"}
+    w._xfer_blocks_for_req = lambda req_id, meta, notify=True: [1000, 1001]
+
+    _real_do_start_push_kv(w, "req", ([1, 2, 3],), _registration_data("req"))
+
+    assert w._sending_transfers["req"] == [1000, 1001]
 
 
 def test_stale_engine_evicted_on_push():
@@ -1568,15 +1578,13 @@ class TestPushWriterMlaReplication:
             ),
         )
 
-        w._xfer_blocks_for_req(req_id="p-req", meta=meta)
+        handles = w._xfer_blocks_for_req(req_id="p-req", meta=meta)
 
         # Every handshook D rank must receive a real WRITE of the latent...
         assert sorted(written) == [0, 1]
         # ...and no rank may be fobbed off with a bare completion notif.
         assert w.nixl_wrapper.send_notif.call_count == 0
-        # All of the request's WRITE handles must be tracked together, so the
-        # engine thread never sees a partial set and double-frees the request.
-        assert sorted(w._sending_transfers["p-req"]) == [1000, 1001]
+        assert sorted(handles) == [1000, 1001]
 
     def test_csa_linear_writes_every_group_to_each_target(self):
         from types import SimpleNamespace
@@ -1643,7 +1651,7 @@ class TestPushWriterMlaReplication:
             ),
         )
 
-        w._xfer_blocks_for_req(req_id="p-req", meta=meta)
+        handles = w._xfer_blocks_for_req(req_id="p-req", meta=meta)
 
         assert [write["read_spec"].remote_rank for write in writes] == [0, 1]
         assert [write["read_spec"].local_block_ids for write in writes] == [
@@ -1651,7 +1659,7 @@ class TestPushWriterMlaReplication:
             list(block_ids),
         ]
         assert [write["local_xfer_side_handle"] for write in writes] == [2000, 2001]
-        assert sorted(w._sending_transfers["p-req"]) == [3000, 3001]
+        assert sorted(handles) == [3000, 3001]
 
 
 class TestPushPrefixCaching:
