@@ -17,21 +17,22 @@ Explicit `NixlPullConnector` and `NixlPushConnector` names ignore this option.
 Under `MultiConnector`, set `transfer_mode` in the NIXL child's
 `kv_connector_extra_config`.
 
-## Chunked prefill push
+## Early push
 
-`NixlPushConnector` can send completed prompt blocks after each prefill chunk
-instead of waiting for the request to finish. It is enabled on the producer by
-`enable_chunked_push` in `kv_connector_extra_config` (see
-[NIXL connector usage](../features/nixl_connector_usage.md)) and is off by
-default. Chunked push is used only in the configurations it is tested in: a
+`NixlPushConnector` can start writing a request's KV cache as soon as its final
+prefill step completes, instead of waiting for the request to finish. It is
+enabled on the producer by `enable_early_push` in `kv_connector_extra_config`
+(see [NIXL connector usage](../features/nixl_connector_usage.md)) and is off by
+default. Early push is used only in the configurations it is tested in: a
 device KV buffer, PP1, PCP1, DCP1, one transferable full-attention cache group,
 and P and D with the same TP. In other configurations a warning is logged and
 requests are pushed whole.
 
-Chunked push changes only when blocks are written. Block lifetimes are those of
+Early push changes only when the WRITEs start. Block lifetimes are those of
 whole-request push: a running request owns its blocks, preemption and abort
 release them, and a finished request holds them under the KV lease
-(`kv_lease_duration`), which D's heartbeats extend.
+(`kv_lease_duration`), which D's heartbeats extend. D starts decoding after a
+completion notification sent once every WRITE of the request has completed.
 
 * While the request runs, each step's newly computed prompt blocks are written
   to D once the step's event completes, without a notification.
