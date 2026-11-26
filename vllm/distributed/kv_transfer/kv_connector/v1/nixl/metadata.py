@@ -273,17 +273,12 @@ class ReqMeta:
 
 
 @dataclass(frozen=True)
-class NixlPushChunkJob:
-    """Prompt blocks `[start_block, end_block)` of a running request, with
-    their ids in its full-attention block table. `total_blocks` is the
-    prompt's block count; the job that ends there is the request's last.
-    """
+class NixlPushJob:
+    """The prompt blocks of a request whose prompt is computed in this step,
+    with their ids in its full-attention block table."""
 
     request_id: ReqId
     block_ids: list[int]
-    start_block: int
-    end_block: int
-    total_blocks: int
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
@@ -307,13 +302,13 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # Push mode (P side): newly finished request blocks to be matched
         # against pending D registrations on the P worker.
         self.push_finished_blocks: dict[ReqId, BlockIds] = {}
-        # Push mode (P side): computed prompt blocks to send before the request
-        # finishes, and the chunk-pushed requests preempted or aborted since
-        # the last step, whose chunk WRITEs are settled before their blocks are
-        # reused.
-        self.push_chunk_jobs: list[NixlPushChunkJob] = []
-        self.push_chunk_preemptions: set[ReqId] = set()
-        self.push_chunk_aborts: set[ReqId] = set()
+        # Push mode (P side): the prompt blocks to send before the request
+        # finishes, and the requests with a push job preempted or aborted
+        # since the last step, whose WRITEs are settled before their blocks
+        # are reused.
+        self.push_jobs: list[NixlPushJob] = []
+        self.push_job_preemptions: set[ReqId] = set()
+        self.push_job_aborts: set[ReqId] = set()
 
     def _add_new_req(
         self,
