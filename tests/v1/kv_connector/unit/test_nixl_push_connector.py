@@ -481,8 +481,6 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._push_deferred = []
         w._push_states = {}
         w._push_transfers = {}
-        w._push_transfer_tasks = {}
-        w._next_push_transfer_id = 0
         w._push_retirements = []
 
         # Base worker fields touched by start_load_kv / _get_new_notifs.
@@ -838,6 +836,53 @@ def test_queued_job_of_a_retired_request_is_dropped():
     assert _retire(w, preempted=False).is_set()
     assert w._push_deferred == []
     assert w.writes == []
+
+
+def test_preempted_job_state_is_reset_in_place_once_its_writes_settle():
+    w = _push_worker()
+    w.nixl_wrapper.check_xfer_state.return_value = "PROC"
+    _publish(w, _push_job())
+    w._process_push_jobs()
+    assert w._push_states["req-p"].pending
+
+    assert not _retire(w, preempted=True).is_set()
+    state = w._push_states["req-p"]
+    assert state.retired
+    assert not state.notified
+
+    w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+    w._poll_push_transfers()
+    # The same state serves the recomputed prompt, with D's registration
+    # kept and the previous job's outcome dropped.
+    assert w._push_states["req-p"] is state
+    assert not (state.pending or state.submitted or state.failed or state.retired)
+    assert state.reg_data is not None
+    assert "req-p" not in w._push_transfers
+
+    w.nixl_wrapper.check_xfer_state.return_value = "PROC"
+    _publish(w, _push_job())
+    w._process_push_jobs()
+    assert len(w.writes) == 2
+
+
+def test_preemption_that_does_not_settle_drops_the_recompute_job():
+    w = _push_worker()
+    w.nixl_wrapper.check_xfer_state.return_value = "PROC"
+    _publish(w, _push_job())
+    w._process_push_jobs()
+
+    # The wait times out: the previous job's WRITEs may still read the blocks.
+    w._lease_extension = 0
+    meta = NixlConnectorMetadata()
+    meta.push_job_preemptions = {"req-p"}
+    with patch("vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker.logger"):
+        w.handle_preemptions(meta)
+
+    # The recompute is not pushed to blocks the request no longer owns; the
+    # request is pushed when it finishes instead.
+    _publish(w, _push_job())
+    assert w._push_deferred == []
+    assert len(w.writes) == 1
 
 
 @pytest.mark.parametrize("preempted", [True, False])
