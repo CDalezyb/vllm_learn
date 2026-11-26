@@ -37,7 +37,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
-    NixlPushChunkJob,
+    NixlPushJob,
     ReqId,
 )
 from vllm.logger import init_logger
@@ -56,7 +56,7 @@ logger = init_logger(__name__)
 
 
 @dataclass
-class _ChunkPushTracker:
+class _PushJobTracker:
     request: Request
     next_block: int = 0
 
@@ -111,15 +111,15 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         )
 
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
-        self._chunked_push = bool(extra_config.get("enable_chunked_push", False))
-        self._chunk_trackers: dict[ReqId, _ChunkPushTracker] = {}
-        self._chunk_aborts: set[ReqId] = set()
+        self._early_push = bool(extra_config.get("enable_early_push", False))
+        self._push_trackers: dict[ReqId, _PushJobTracker] = {}
+        self._push_job_aborts: set[ReqId] = set()
 
-        if self._chunked_push:
+        if self._early_push:
             parallel_config = vllm_config.parallel_config
             transfer_groups = kv_cache_config.transfer_groups
             if vllm_config.kv_transfer_config.kv_role != "kv_producer":
-                self._chunked_push = False
+                self._early_push = False
             elif (
                 self.use_host_buffer
                 or parallel_config.pipeline_parallel_size != 1
@@ -128,14 +128,14 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
                 or len(transfer_groups) != 1
                 or not issubclass(transfer_groups[0].manager_cls, FullAttentionManager)
             ):
-                # Chunked push is used only in the configurations it is tested
+                # Early push is used only in the configurations it is tested
                 # in; the others push requests whole.
                 logger.warning(
-                    "NIXL chunked push needs a device KV buffer, PP=1, PCP=1, "
+                    "NIXL early push needs a device KV buffer, PP=1, PCP=1, "
                     "DCP=1 and one full-attention KV cache group. Falling back "
                     "to whole-request push."
                 )
-                self._chunked_push = False
+                self._early_push = False
 
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
@@ -183,12 +183,12 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # matches what the worker expects on the next step.
         if params.get("do_remote_decode"):
             self._reqs_in_batch.add(request.request_id)
-            if self._chunked_push and request.max_tokens == 1:
-                # The last chunk notifies D once the prompt is computed, so
+            if self._early_push and request.max_tokens == 1:
+                # The last push job notifies D once the prompt is computed, so
                 # only requests that finish with the prompt are pushed in
-                # chunks; the others are pushed whole when they finish.
+                # push jobs; the others are pushed whole when they finish.
                 # A preempted request starts again from the first block.
-                self._chunk_trackers[request.request_id] = _ChunkPushTracker(request)
+                self._push_trackers[request.request_id] = _PushJobTracker(request)
 
         # P side with host-buffer offload: defer save to the worker.
         if self.use_host_buffer and params.get("do_remote_decode"):
@@ -293,15 +293,15 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             return False, None
 
         tracked = (
-            self._chunked_push
-            and self._chunk_trackers.pop(request.request_id, None) is not None
+            self._early_push
+            and self._push_trackers.pop(request.request_id, None) is not None
         )
         if request.status not in (
             RequestStatus.FINISHED_LENGTH_CAPPED,
             RequestStatus.FINISHED_STOPPED,
         ):
             if tracked:
-                self._chunk_aborts.add(request.request_id)
+                self._push_job_aborts.add(request.request_id)
             self._reqs_not_processed.add(request.request_id)
             self._reqs_need_save.pop(request.request_id, None)
             return False, None
@@ -349,8 +349,8 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         meta = super().build_connector_meta(scheduler_output)
         assert isinstance(meta, NixlConnectorMetadata)
 
-        if self._chunked_push:
-            self._build_chunk_jobs(meta, scheduler_output)
+        if self._early_push:
+            self._build_push_jobs(meta, scheduler_output)
 
         # Watchdog: any D-side registration whose deadline has passed without
         # a corresponding push completion is treated as failed and cleaned up.
@@ -391,15 +391,15 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
 
         return meta
 
-    def _build_chunk_jobs(
+    def _build_push_jobs(
         self,
         meta: NixlConnectorMetadata,
         scheduler_output: SchedulerOutput,
     ) -> None:
         for req_id in scheduler_output.preempted_req_ids or ():
-            if req_id in self._chunk_trackers:
-                meta.push_chunk_preemptions.add(req_id)
-        meta.push_chunk_aborts, self._chunk_aborts = self._chunk_aborts, set()
+            if req_id in self._push_trackers:
+                meta.push_job_preemptions.add(req_id)
+        meta.push_job_aborts, self._push_job_aborts = self._push_job_aborts, set()
 
         block_state = scheduler_output.kv_connector_block_state
         assert block_state is not None
@@ -410,7 +410,7 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             req_id,
             num_scheduled_tokens,
         ) in scheduler_output.num_scheduled_tokens.items():
-            tracker = self._chunk_trackers.get(req_id)
+            tracker = self._push_trackers.get(req_id)
             if tracker is None:
                 continue
             request = tracker.request
@@ -433,8 +433,8 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             transfer_block_ids = self.kv_cache_config.select_transfer_block_ids(
                 all_block_ids
             )
-            meta.push_chunk_jobs.append(
-                NixlPushChunkJob(
+            meta.push_jobs.append(
+                NixlPushJob(
                     request_id=req_id,
                     block_ids=list(transfer_block_ids[0][start_block:end_block]),
                     start_block=start_block,

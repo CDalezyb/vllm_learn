@@ -17,18 +17,18 @@ Explicit `NixlPullConnector` and `NixlPushConnector` names ignore this option.
 Under `MultiConnector`, set `transfer_mode` in the NIXL child's
 `kv_connector_extra_config`.
 
-## Chunked prefill push
+## Early push
 
 `NixlPushConnector` can send completed prompt blocks after each prefill chunk
 instead of waiting for the request to finish. It is enabled on the producer by
-`enable_chunked_push` in `kv_connector_extra_config` (see
+`enable_early_push` in `kv_connector_extra_config` (see
 [NIXL connector usage](../features/nixl_connector_usage.md)) and is off by
-default. Chunked push is used only in the configurations it is tested in: a
+default. Early push is used only in the configurations it is tested in: a
 device KV buffer, PP1, PCP1, DCP1, one transferable full-attention cache group,
 and P and D with the same TP. In other configurations a warning is logged and
 requests are pushed whole.
 
-Chunked push changes only when blocks are written. Block lifetimes are those of
+Early push changes only when blocks are written. Block lifetimes are those of
 whole-request push: a running request owns its blocks, preemption and abort
 release them, and a finished request holds them under the KV lease
 (`kv_lease_duration`), which D's heartbeats extend.
@@ -42,14 +42,14 @@ release them, and a finished request holds them under the KV lease
   endpoint flush completes, which some UCX versions report before all of an
   SGL WRITE's data is posted.
 * When the request finishes, the existing whole-request path reports it once D
-  has been notified. If a chunk was not written and D was not notified (D not
+  has been notified. If the push job was not written and D was not notified (D not
   handshaked yet, an incompatible peer or a failed WRITE), the whole request
   is written instead; if D has not registered yet, the request waits for its
   registration as a whole-request push does. D is notified at most once: if
   sending the notification fails, it may still have reached D, so the request
   is left to the lease, as a failed whole-request push is.
 * When the request is preempted or aborted, `handle_preemptions` drops its
-  queued chunk jobs and waits for its submitted WRITEs before the blocks can be
+  queued push jobs and waits for its submitted WRITEs before the blocks can be
   reused. A preempted request is pushed again from the first block once
   recomputed, so D's blocks end up holding a single complete version before
   the notification. If D was already notified, which async
