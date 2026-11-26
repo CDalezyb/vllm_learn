@@ -457,8 +457,6 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._push_deferred = []
         w._push_states = {}
         w._push_transfers = {}
-        w._push_transfer_tasks = {}
-        w._next_push_transfer_id = 0
         w._push_retirements = []
 
         # Base worker fields touched by start_load_kv / _get_new_notifs.
@@ -625,6 +623,7 @@ def _retire(w: _StubWriterWorker, preempted: bool) -> threading.Event:
     retirement = _PushRetirement(
         preempted={"req-p"} if preempted else set(),
         aborted=set() if preempted else {"req-p"},
+        deadline=time.monotonic() + 60,
     )
     w._prefill_inbox.put(retirement)
     w._take_prefill_inbox()
@@ -789,6 +788,82 @@ def test_queued_job_of_a_retired_request_is_dropped():
     assert _retire(w, preempted=False).is_set()
     assert w._push_deferred == []
     assert w.writes == []
+
+
+def test_preempted_job_state_is_reset_in_place_once_its_writes_settle():
+    w = _push_worker()
+    w.nixl_wrapper.check_xfer_state.return_value = "PROC"
+    _publish(w, _push_job())
+    w._process_push_jobs()
+    state = w._push_states["req-p"]
+    assert state.pending
+
+    assert not _retire(w, preempted=True).is_set()
+    # The same state is kept, with its job dropped.
+    assert w._push_states["req-p"] is state
+    assert state.retired
+
+    w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+    w._poll_push_transfers()
+    # The state serves the recomputed prompt: D's registration is kept and the
+    # previous job's outcome is dropped.
+    assert w._push_states["req-p"] is state
+    assert not (state.pending or state.submitted or state.failed or state.retired)
+    assert state.reg_data is not None
+    assert "req-p" not in w._push_transfers
+
+
+def test_recorded_finish_survives_the_in_place_reset():
+    """A finish recorded while the preempted job was in flight is handed off
+    after the reset, so the request is pushed as a whole."""
+    w = _push_worker()
+    w.nixl_wrapper.check_xfer_state.return_value = "PROC"
+    _publish(w, _push_job())
+    w._process_push_jobs()
+    assert not _retire(w, preempted=True).is_set()
+    assert w._set_push_finished("req-p", ([1, 2],))
+
+    w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+    w._poll_push_transfers()
+    w._process_push_handoffs()
+    assert w.start_push_calls == [
+        ("req-p", ([1, 2],), _registration_data("req-d", local_block_ids=((100, 101),)))
+    ]
+
+
+def test_preemption_that_does_not_settle_drops_the_recompute_job():
+    w = _push_worker()
+    w.nixl_wrapper.check_xfer_state.return_value = "PROC"
+    _publish(w, _push_job())
+    w._process_push_jobs()
+
+    # The wait times out: the previous job's WRITEs may still read the blocks.
+    w._lease_extension = 0
+    meta = NixlConnectorMetadata()
+    meta.push_job_preemptions = {"req-p"}
+    w.handle_preemptions(meta)
+
+    # The recompute is not pushed to blocks the request no longer owns.
+    _publish(w, _push_job())
+    w._process_push_jobs()
+    assert w._push_deferred == []
+    assert len(w.writes) == 1
+
+    # The settle deadline passes with the WRITE still in flight: the job is
+    # abandoned, so the hand-off pushes the whole prompt at finish.
+    assert w._set_push_finished("req-p", ([1, 2],))
+    with patch("vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker.logger"):
+        w._poll_push_transfers()
+    assert w._push_retirements == []
+    assert w._push_states["req-p"].retired
+    assert not w._push_states["req-p"].pending
+    # The abandoned job is never reported to D as complete.
+    w._notify_pushed_requests()
+    assert w.notifs == []
+    w._process_push_handoffs()
+    assert w.start_push_calls == [
+        ("req-p", ([1, 2],), _registration_data("req-d", local_block_ids=((100, 101),)))
+    ]
 
 
 @pytest.mark.parametrize("notified", [False, True])

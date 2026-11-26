@@ -92,7 +92,10 @@ class _PushJobState:
     # The completion notification was sent to D, which then decodes. It is
     # sent once, after every WRITE of the job has completed.
     notified: bool = False
-    # Set once the request's state is dropped; its job is skipped.
+    # Set while the request is preempted: its job is dropped, no notification
+    # is sent, and a new job is refused. The reset clears it once the WRITEs
+    # settle; when they outlive the settle wait it stays set, and the request
+    # is pushed when it finishes.
     retired: bool = False
     # D's registration, taken from the pending ones once the job finds it.
     reg_data: dict[str, Any] | None = None
@@ -104,17 +107,19 @@ class _PushJobState:
 class _PushTask:
     job: NixlPushJob
     event: torch.Event
-    # Set by the writer when it takes the task from the inbox.
-    state: _PushJobState = field(init=False)
 
 
 @dataclass
 class _PushRetirement:
     """Preempted and aborted requests whose push jobs are dropped. `done`
-    is set once none of their WRITEs is in flight."""
+    is set once none of their WRITEs is in flight, or once `deadline`
+    passes."""
 
     preempted: set[ReqId]
     aborted: set[ReqId]
+    # Stop gating on a WRITE that outlives the settle wait, so the request is
+    # pushed when it finishes instead.
+    deadline: float
     done: threading.Event = field(default_factory=threading.Event)
 
 
@@ -188,9 +193,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         self._push_deferred: list[_PushTask] = []
         self._push_retirements: list[_PushRetirement] = []
         self._push_states: dict[ReqId, _PushJobState] = {}
-        self._push_transfers: dict[str, list[TransferHandle]] = {}
-        self._push_transfer_tasks: dict[str, _PushTask] = {}
-        self._next_push_transfer_id = 0
+        # A request has one job's WRITEs in flight at a time: its state is
+        # reset only once those WRITEs settle.
+        self._push_transfers: dict[ReqId, list[TransferHandle]] = {}
 
     def _validate_remote_parallel_config(
         self, agent_metadata: NixlAgentMetadata
@@ -262,7 +267,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             for handle in handles:
                 self.nixl_wrapper.release_xfer_handle(handle)
         self._push_transfers.clear()
-        self._push_transfer_tasks.clear()
         super().shutdown()
 
     # --- Engine-main-thread entry point -------------------------------- #
@@ -341,24 +345,23 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
     def handle_preemptions(self, metadata: NixlConnectorMetadata) -> None:
         """Have the writer drop the push jobs of preempted and aborted
         requests, and wait until none of their WRITEs is in flight, so the
-        blocks are not overwritten while being read. A preempted request
-        whose D was not notified yet is pushed again once recomputed."""
+        blocks are not overwritten while being read. The wait is bounded: a
+        WRITE that outlives it is abandoned and the request is pushed when it
+        finishes. A preempted request whose D was not notified yet is pushed
+        again once recomputed."""
         if not self._early_push or not (
             metadata.push_job_preemptions or metadata.push_job_aborts
         ):
             return
         retirement = _PushRetirement(
-            set(metadata.push_job_preemptions), set(metadata.push_job_aborts)
+            set(metadata.push_job_preemptions),
+            set(metadata.push_job_aborts),
+            time.monotonic() + self._lease_extension,
         )
         self._prefill_inbox.put(retirement)
         self._push_writer_wake.set()
-        if not retirement.done.wait(self._lease_extension):
-            logger.error(
-                "NIXL push WRITEs of requests %s did not complete within %ds; "
-                "their blocks may be reused while still being read.",
-                retirement.preempted | retirement.aborted,
-                self._lease_extension,
-            )
+        # The writer logs the WRITEs that outlive the wait.
+        retirement.done.wait(self._lease_extension)
 
     # --- Writer thread ------------------------------------------------- #
 
@@ -472,15 +475,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
     def _drop_push_request(self, req_id: ReqId) -> None:
         """Drop the request's push state; its job is skipped."""
-        if (state := self._push_states.pop(req_id, None)) is not None:
-            state.retired = True
-
-    def _restart_push_request(self, req_id: ReqId) -> None:
-        """Drop the request's push job; its recomputed prompt is pushed again
-        to the same D blocks."""
-        reg_data = self._push_states[req_id].reg_data
-        self._drop_push_request(req_id)
-        self._push_states[req_id] = _PushJobState(reg_data=reg_data)
+        self._push_states.pop(req_id, None)
 
     def _take_prefill_inbox(self) -> None:
         while True:
@@ -505,17 +500,22 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 for req_id in item.preempted:
                     state = self._push_states.get(req_id)
                     if state is not None and not state.notified:
-                        self._restart_push_request(req_id)
+                        # The job is dropped here; the state is reset once its
+                        # WRITEs settle, and the recompute is pushed then.
+                        state.retired = True
                 self._push_retirements.append(item)
                 continue
             # Queued in order, so a retirement drops only earlier jobs.
             req_id = item.job.request_id
             state = self._push_states.setdefault(req_id, _PushJobState())
+            if state.retired:
+                # The previous job's WRITEs did not settle yet; the request is
+                # pushed when it finishes instead.
+                continue
             if state.notified:
                 # Handed off before a preemption; the recompute is not sent.
                 continue
             state.pending = True
-            item.state = state
             self._push_deferred.append(item)
 
     def _process_push_jobs(self) -> None:
@@ -527,14 +527,17 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 self._process_push_task(task)
             except Exception:
                 logger.exception("NIXL early push failed for %s", task.job.request_id)
-                self._finish_push_job(task, failed=True)
+                state = self._push_states.get(task.job.request_id)
+                if state is not None:
+                    self._finish_push_job(state, failed=True)
 
     def _process_push_task(self, task: _PushTask) -> None:
-        job, state = task.job, task.state
-        if state.retired:
+        req_id = task.job.request_id
+        state = self._push_states.get(req_id)
+        if state is None or state.retired:
             return
         if state.reg_data is None:
-            state.reg_data = self._pop_matching_registration(job.request_id)
+            state.reg_data = self._pop_matching_registration(req_id)
         reg_data = state.reg_data
         if reg_data is None:
             self._push_deferred.append(task)
@@ -550,62 +553,82 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         ):
             # D is not handshaked yet; the call has started the handshake,
             # and the request is pushed when it finishes.
-            self._finish_push_job(task, failed=True)
+            self._finish_push_job(state, failed=True)
             return
         if not task.event.query():
             self._push_deferred.append(task)
             return
         if not self._push_path_supported(reg_data):
-            self._finish_push_job(task, failed=True)
+            self._finish_push_job(state, failed=True)
             return
 
         handles: list[TransferHandle] = []
         failed = False
         try:
             handles = self._push_blocks(
-                job.request_id,
-                (job.block_ids,),
+                req_id,
+                (task.job.block_ids,),
                 self._as_grouped_block_ids(reg_data["local_block_ids"]),
                 reg_data,
                 notify=False,
             )
         except Exception:
-            logger.exception("NIXL early push submission failed for %s", job.request_id)
+            logger.exception("NIXL early push submission failed for %s", req_id)
             failed = True
         with self._sending_transfers_lock:
-            if job.request_id in self._send_failures:
-                self._send_failures.discard(job.request_id)
+            if req_id in self._send_failures:
+                self._send_failures.discard(req_id)
                 failed = True
         if handles:
             state.failed |= failed
             state.submitted = True
-            transfer_id = f"{job.request_id}:{self._next_push_transfer_id}"
-            self._next_push_transfer_id += 1
-            self._push_transfers[transfer_id] = handles
-            self._push_transfer_tasks[transfer_id] = task
+            self._push_transfers[req_id] = handles
         else:
             # No WRITE was posted: the request is pushed when it finishes.
-            self._finish_push_job(task, failed=True)
+            self._finish_push_job(state, failed=True)
 
-    def _finish_push_job(self, task: _PushTask, failed: bool = False) -> None:
-        task.state.pending = False
-        task.state.failed |= failed
+    @staticmethod
+    def _finish_push_job(state: _PushJobState, failed: bool = False) -> None:
+        state.pending = False
+        state.failed |= failed
 
     def _poll_push_transfers(self) -> None:
         done, failed = self._pop_done_transfers(self._push_transfers)
         # A failed WRITE may still have sibling handles in flight.
-        for transfer_id in failed:
-            self._push_transfer_tasks[transfer_id].state.failed = True
-        for transfer_id in done:
-            self._finish_push_job(self._push_transfer_tasks.pop(transfer_id))
+        for req_id in failed:
+            if (state := self._push_states.get(req_id)) is not None:
+                state.failed = True
+        for req_id in done:
+            if (state := self._push_states.get(req_id)) is not None:
+                self._finish_push_job(state)
+        now = time.monotonic()
         for retirement in list(self._push_retirements):
             retired = retirement.preempted | retirement.aborted
-            if any(
-                task.job.request_id in retired
-                for task in self._push_transfer_tasks.values()
-            ):
+            in_flight = any(req_id in self._push_transfers for req_id in retired)
+            if in_flight and now < retirement.deadline:
                 continue
             self._push_retirements.remove(retirement)
+            if in_flight:
+                logger.error(
+                    "NIXL push WRITEs of requests %s did not settle within "
+                    "%ds; their blocks may be reused while still being read.",
+                    retired,
+                    self._lease_extension,
+                )
+            for req_id in retirement.preempted:
+                state = self._push_states.get(req_id)
+                if state is None or not state.retired:
+                    continue
+                if in_flight:
+                    # The WRITEs outlived the settle wait: the job is
+                    # abandoned and the request is pushed when it finishes.
+                    state.pending = False
+                    continue
+                # The job's WRITEs no longer read the blocks, so the recomputed
+                # prompt can be pushed to the same D blocks. A recorded finish
+                # is kept: the hand-off then falls back to a whole-request push.
+                state.pending = state.submitted = state.failed = False
+                state.notified = state.retired = False
             retirement.done.set()
 
     def _notify_pushed_requests(self) -> None:
@@ -616,7 +639,13 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         the flush, which some UCX versions complete before all of an SGL
         WRITE's data is posted."""
         for req_id, state in self._push_states.items():
-            if state.notified or state.failed or state.pending or not state.submitted:
+            if (
+                state.notified
+                or state.retired
+                or state.failed
+                or state.pending
+                or not state.submitted
+            ):
                 continue
             assert state.reg_data is not None
             # Set first: a send that raises may still have reached D.

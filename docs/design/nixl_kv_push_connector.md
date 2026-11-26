@@ -53,7 +53,9 @@ release them, and a finished request holds them under the KV lease
   drops the job if it is still queued and waits for its submitted WRITEs
   before the blocks can be reused. A preempted request is pushed again once
   recomputed, unless D was already notified, which async scheduling allows
-  before the request finishes.
+  before the request finishes; if its WRITEs do not settle within the wait,
+  the recompute job is dropped and the request is pushed when it finishes.
+  Such a WRITE is abandoned and logged, so it may read reused blocks.
 
 D only reads its blocks after the completion notification, so the D-side
 scheduler and decode admission path are unchanged.
