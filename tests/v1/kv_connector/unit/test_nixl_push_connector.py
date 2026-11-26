@@ -371,11 +371,38 @@ class TestEarlyPushScheduler:
         output.num_scheduled_tokens = {request.request_id: 8}
         (job,) = sched.build_connector_meta(output).push_jobs
         # The prompt's blocks only, its partial last block included.
-        assert (job.request_id, job.block_ids) == (request.request_id, [1, 2, 3])
+        assert (job.request_id, job.block_ids) == (request.request_id, ([1, 2, 3],))
 
         request.num_computed_tokens = 40
         output.num_scheduled_tokens = {request.request_id: 1}
         assert sched.build_connector_meta(output).push_jobs == []
+
+    def test_push_job_covers_every_kv_cache_group(self):
+        vllm_config = create_vllm_config(
+            kv_connector="NixlPushConnector",
+            kv_role="kv_producer",
+            kv_connector_extra_config={"enable_early_push": True},
+        )
+        kv_cache_config = make_kv_cache_config(
+            block_size=16, num_blocks=8, mamba_enabled=True
+        )
+        sched = NixlPushConnectorScheduler(
+            vllm_config, "test-prefill-engine", kv_cache_config
+        )
+        request = create_request(num_tokens=40, block_size=16, do_remote_decode=True)
+        sched.update_state_after_alloc(
+            request, _BlocksMock(([1, 2, 3], [4, 5, 6])), 0
+        )
+        output = SchedulerOutput.make_empty()
+        output.preempted_req_ids = set()
+        output.kv_connector_block_state = KVConnectorBlockState(
+            req_ids={request.request_id},
+            resolve_block_ids=lambda _: ([1, 2, 3], [4, 5, 6]),
+            boundary_state_offloads={},
+        )
+        output.num_scheduled_tokens = {request.request_id: 40}
+        (job,) = sched.build_connector_meta(output).push_jobs
+        assert job.block_ids == ([1, 2, 3], [6])
 
     def test_request_generating_more_tokens_is_pushed_when_it_finishes(self):
         sched, _, output = self._scheduler_with_request()
@@ -402,7 +429,7 @@ class TestEarlyPushScheduler:
         output.preempted_req_ids = set()
         output.num_scheduled_tokens = {request.request_id: 40}
         (job,) = sched.build_connector_meta(output).push_jobs
-        assert job.block_ids == [1, 2, 3]
+        assert job.block_ids == ([1, 2, 3],)
 
     @pytest.mark.parametrize("tracked", [True, False])
     def test_only_tracked_aborts_reach_the_worker(self, tracked):
@@ -570,7 +597,7 @@ def _push_worker() -> _StubWriterWorker:
 
 
 def _push_job(request_id: str = "req-p") -> NixlPushJob:
-    return NixlPushJob(request_id=request_id, block_ids=[1, 2])
+    return NixlPushJob(request_id=request_id, block_ids=([1, 2],))
 
 
 def _publish(w: _StubWriterWorker, *jobs: NixlPushJob, ready: bool = True):
@@ -702,7 +729,7 @@ def test_job_that_raises_fails_only_its_request():
     )
     # Raises KeyError for req-p's job.
     w._push_path_supported = lambda reg_data: {"req-q": True}[reg_data["request_id"]]
-    _publish(w, _push_job(), NixlPushJob("req-q", [5]))
+    _publish(w, _push_job(), NixlPushJob("req-q", ([5],)))
     w._process_push_jobs()
     assert w._push_states["req-p"].failed
     assert w.writes == [(([5],), ((200,),), False)]
