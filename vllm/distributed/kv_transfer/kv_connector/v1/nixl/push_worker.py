@@ -36,7 +36,7 @@ import queue
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -683,6 +683,44 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
     # --- D-side registration send (writer thread) ---------------------- #
 
+    def _defer_until_handshake(
+        self,
+        *,
+        engine_id: str,
+        host: str,
+        port: int,
+        tp_size: int,
+        on_ready: Callable[[], None],
+        on_failure: Callable[[Exception], None],
+        **handshake_kwargs: Any,
+    ) -> bool:
+        """Start the P->D handshake in the background.
+
+        Returns True when the caller must return and wait: `on_ready` runs
+        once the handshake completes, then wakes the writer. Returns False
+        when the handshake is already ready, so the caller proceeds directly.
+        """
+        fut = self._ensure_handshake(
+            engine_id, host, port, tp_size, **handshake_kwargs
+        )
+        if fut is None:
+            return False
+
+        def _on_handshake(
+            f: Future[tuple[dict[tuple[int, int], str], float]],
+        ) -> None:
+            try:
+                f.result()
+            except Exception as e:
+                on_failure(e)
+                return
+            on_ready()
+            # Wake the writer so it acts promptly even if otherwise parked.
+            self._push_writer_wake.set()
+
+        fut.add_done_callback(_on_handshake)
+        return True
+
     def _send_registration_to_p(
         self,
         req_id: str,
@@ -693,42 +731,32 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         and the request is re-queued onto `_reg_send_inbox` once it
         completes (at which point `_ensure_handshake` returns `None` and we
         send directly)."""
-        remote_pp_size = reg_data.get("remote_pp_size", 1)
-        fut = self._ensure_handshake(
-            reg_data["remote_engine_id"],
-            reg_data["remote_host"],
-            reg_data["remote_port"],
-            reg_data["remote_tp_size"],
-            pp_size=remote_pp_size,
+
+        def _ready() -> None:
+            # Re-queue for the writer to send now that the handshake is done.
+            self._reg_send_inbox.put((req_id, reg_data))
+
+        def _failed(error: Exception) -> None:
+            self._log_failure(
+                failure_type="push_reg_handshake_failed", req_id=req_id, error=error
+            )
+            self._failed_recv_reqs.put(req_id)
+
+        if self._defer_until_handshake(
+            engine_id=reg_data["remote_engine_id"],
+            host=reg_data["remote_host"],
+            port=reg_data["remote_port"],
+            tp_size=reg_data["remote_tp_size"],
+            on_ready=_ready,
+            on_failure=_failed,
+            pp_size=reg_data.get("remote_pp_size", 1),
             # D only ever sends PUSH_REG notifs to P and never reads or writes
             # P's memory in push mode, so it never needs the transfer
             # descriptors set up by the full add_remote_agent path.
             notif_agents_only=True,
-        )
-        if fut is None:
-            self._do_send_reg_notif(req_id, reg_data)
+        ):
             return
-
-        def _on_handshake(
-            f: Future[tuple[dict[tuple[int, int], str], float]],
-            rid: str = req_id,
-            rd: dict[str, Any] = reg_data,
-        ) -> None:
-            try:
-                f.result()
-            except Exception as e:
-                self._log_failure(
-                    failure_type="push_reg_handshake_failed", req_id=rid, error=e
-                )
-                self._failed_recv_reqs.put(rid)
-                return
-            # Re-queue for the writer to send now that the handshake is done.
-            self._reg_send_inbox.put((rid, rd))
-            # Wake the writer so it sends the PUSH_REG promptly even if
-            # otherwise parked.
-            self._push_writer_wake.set()
-
-        fut.add_done_callback(_on_handshake)
+        self._do_send_reg_notif(req_id, reg_data)
 
     def _do_send_reg_notif(self, req_id: str, reg_data: dict[str, Any]) -> None:
         engine_id = reg_data["remote_engine_id"]
@@ -764,37 +792,30 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
     # --- Matching helpers --------------------------------------------- #
 
-    def _pop_matching_registration(self, request_id: str) -> dict[str, Any] | None:
-        """Pop the D-side registration matching *request_id*.
-
-        Exact key first, then a match after stripping the random suffix from
-        both sides. No match leaves the request unmatched (push not started).
-        """
-        data = self._pending_d_registrations.pop(request_id, None)
-        if data is not None:
-            return data
+    @staticmethod
+    def _matching_key(mapping: dict[Any, Any], request_id: str) -> Any | None:
+        """Return the key in *mapping* matching *request_id*: exact key first,
+        then a match after stripping the random suffix from both sides."""
+        if request_id in mapping:
+            return request_id
         base_id = get_base_request_id(request_id)
-        for reg_id in list(self._pending_d_registrations):
-            if get_base_request_id(reg_id) == base_id:
-                return self._pending_d_registrations.pop(reg_id)
+        for key in mapping:
+            if get_base_request_id(key) == base_id:
+                return key
         return None
+
+    def _pop_matching_registration(self, request_id: str) -> dict[str, Any] | None:
+        """Pop the D-side registration matching *request_id*. No match leaves
+        the request unmatched (push not started)."""
+        key = self._matching_key(self._pending_d_registrations, request_id)
+        return None if key is None else self._pending_d_registrations.pop(key)
 
     def _pop_matching_finished_blocks(
         self, request_id: str
     ) -> tuple[str, BlockIds] | None:
-        """Pop the P-side finished blocks matching *request_id*.
-
-        Same lookup as `_pop_matching_registration`: exact key, then a
-        match after stripping the random suffix from both sides.
-        """
-        blocks = self._push_finished_blocks.pop(request_id, None)
-        if blocks is not None:
-            return request_id, blocks
-        base_id = get_base_request_id(request_id)
-        for fin_id in list(self._push_finished_blocks):
-            if get_base_request_id(fin_id) == base_id:
-                return fin_id, self._push_finished_blocks.pop(fin_id)
-        return None
+        """Pop the P-side finished blocks matching *request_id*."""
+        key = self._matching_key(self._push_finished_blocks, request_id)
+        return None if key is None else (key, self._push_finished_blocks.pop(key))
 
     # --- WRITE transfer logic (writer thread) ------------------------- #
 
@@ -821,30 +842,25 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         decode_engine_id = registration_data["decode_engine_id"]
 
         # Runs on the background executor; defer the WRITE until it's ready.
-        fut = self._ensure_handshake(
-            decode_engine_id,
-            registration_data["decode_host"],
-            registration_data["decode_port"],
-            registration_data["decode_tp_size"],
-        )
-        if fut is not None:
+        def _ready() -> None:
+            self._deferred_push_inbox.put(
+                (request_id, local_block_ids, registration_data)
+            )
 
-            def _on_handshake(
-                f: Future[tuple[dict[tuple[int, int], str], float]],
-                rid: str = request_id,
-                blocks: BlockIds = local_block_ids,
-                rd: dict[str, Any] = registration_data,
-            ) -> None:
-                if (e := f.exception()) is not None:
-                    # The engine reclaims the blocks via the TTL so we dont free here
-                    self._log_failure(
-                        failure_type="push_handshake_failed", req_id=rid, error=e
-                    )
-                    return
-                self._deferred_push_inbox.put((rid, blocks, rd))
-                self._push_writer_wake.set()
+        def _failed(error: Exception) -> None:
+            # The engine reclaims the blocks via the TTL so we dont free here
+            self._log_failure(
+                failure_type="push_handshake_failed", req_id=request_id, error=error
+            )
 
-            fut.add_done_callback(_on_handshake)
+        if self._defer_until_handshake(
+            engine_id=decode_engine_id,
+            host=registration_data["decode_host"],
+            port=registration_data["decode_port"],
+            tp_size=registration_data["decode_tp_size"],
+            on_ready=_ready,
+            on_failure=_failed,
+        ):
             return
 
         t0 = time.perf_counter()
