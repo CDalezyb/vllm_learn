@@ -109,12 +109,17 @@ class _PushTask:
 
 @dataclass
 class _PushRetirement:
-    """Preempted and aborted requests whose push jobs are dropped. `done`
-    is set once none of their WRITEs is in flight."""
+    """Preempted and aborted requests whose push jobs are dropped. `done` is
+    set once none of their WRITEs is in flight; `preempted_done` covers the
+    preempted ones only, which are the ones the engine waits for."""
 
     preempted: set[ReqId]
     aborted: set[ReqId]
+    # Settle the retirement by this point anyway, so a stuck WRITE cannot pin
+    # the request's blocks or the compactions that follow.
+    deadline: float
     done: threading.Event = field(default_factory=threading.Event)
+    preempted_done: threading.Event = field(default_factory=threading.Event)
 
 
 class NixlPushConnectorWorker(NixlBaseConnectorWorker):
@@ -311,6 +316,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         for req_id in metadata.reqs_not_processed:
             self._reqs_to_process.discard(req_id)
             assert req_id not in self._reqs_to_send
+            # An abort without a leased job is reported here instead of
+            # through a retirement, so drop its push state here too.
+            self._drop_push_request(req_id)
         # Rebase scheduler-clock deadlines onto this worker's clock — see the
         # equivalent block in pull_worker.start_load_kv for the rationale.
         now_local = time.perf_counter()
@@ -340,21 +348,23 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         """Have the writer drop the push jobs of preempted and aborted
         requests. A preempted request's blocks are reused in this step, so
         wait until its WRITEs are no longer in flight; an aborted request's
-        blocks stay under the send lease until the writer reports them. A
-        preempted request whose D was not notified yet is pushed again once
-        recomputed."""
+        blocks stay under the send lease until the writer reports them, so
+        they never gate this wait. A preempted request whose D was not
+        notified yet is pushed again once recomputed."""
         if not self._early_push or not (
             metadata.push_job_preemptions or metadata.push_job_aborts
         ):
             return
         retirement = _PushRetirement(
-            set(metadata.push_job_preemptions), set(metadata.push_job_aborts)
+            set(metadata.push_job_preemptions),
+            set(metadata.push_job_aborts),
+            time.monotonic() + self._lease_extension,
         )
         self._prefill_inbox.put(retirement)
         self._push_writer_wake.set()
         if not retirement.preempted:
             return
-        if not retirement.done.wait(self._lease_extension):
+        if not retirement.preempted_done.wait(self._lease_extension):
             logger.error(
                 "NIXL push WRITEs of requests %s did not complete within %ds; "
                 "their blocks may be reused while still being read.",
@@ -606,24 +616,43 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         for req_id in done:
             if (state := self._push_states.get(req_id)) is not None:
                 self._finish_push_job(state)
+        now = time.monotonic()
         for retirement in list(self._push_retirements):
+            if not any(
+                req_id in self._push_transfers for req_id in retirement.preempted
+            ):
+                retirement.preempted_done.set()
             retired = retirement.preempted | retirement.aborted
-            if any(req_id in self._push_transfers for req_id in retired):
+            in_flight = any(req_id in self._push_transfers for req_id in retired)
+            if in_flight and now < retirement.deadline:
                 continue
             self._push_retirements.remove(retirement)
+            if in_flight:
+                logger.error(
+                    "NIXL push WRITEs of requests %s did not settle; their "
+                    "blocks may be reused while still being read.",
+                    retired,
+                )
             for req_id in retirement.preempted:
                 state = self._push_states.get(req_id)
-                if state is not None and state.retired:
-                    # The job's WRITEs no longer read the blocks, so the
-                    # recomputed prompt can be pushed to the same D blocks.
-                    state.pending = state.submitted = state.failed = False
-                    state.notified = state.retired = False
-                    state.finished_blocks = None
+                if state is None or not state.retired:
+                    continue
+                if in_flight:
+                    # The job is abandoned: its state keeps refusing the
+                    # recompute, which is pushed when the request finishes.
+                    state.pending = False
+                    continue
+                # The job's WRITEs no longer read the blocks, so the recomputed
+                # prompt can be pushed to the same D blocks. A recorded finish
+                # is kept: the hand-off then falls back to a whole-request push.
+                state.pending = state.submitted = state.failed = False
+                state.notified = state.retired = False
             # An aborted request's blocks are held by the send lease, which
             # ends when the engine hears the request as sent.
             with self._sending_transfers_lock:
                 for req_id in retirement.aborted:
                     self._sending_transfers[req_id] = []
+            retirement.preempted_done.set()
             retirement.done.set()
 
     def _notify_pushed_requests(self) -> None:

@@ -13,7 +13,10 @@ In push mode, scheduler-side responsibilities are:
   into `_finished_request_blocks` for the lease, and into
   `_newly_finished_push_blocks` so the P worker picks them up via
   `meta.push_finished_blocks` and matches against any D registrations
-  it already received via NIXL notifications.
+  it already received via NIXL notifications. An aborted request whose push
+  job already reached the worker is stashed into `_finished_request_blocks`
+  only: its blocks are held until the worker reports the WRITEs, so the P
+  worker drops the job instead of pushing the blocks again.
 * Both sides: `has_pending_push_work` keeps the engine main loop stepping
   while pushes are in flight. `update_connector_output` cleans up
   `_finished_request_blocks` once the WRITE completes.
@@ -304,9 +307,12 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         ):
             if tracker is not None and tracker.pushed:
                 # A push job is already with the worker, so its WRITEs may
-                # still read this request's blocks. Keep the blocks under the
-                # send lease until the worker reports them as written, which
-                # the engine thread does not wait for.
+                # still read this request's blocks (empty only if it was
+                # preempted since; the report still drops the job). Keep the
+                # blocks under the send lease until the worker reports them as
+                # written, which the engine thread does not wait for. The
+                # request must stay out of `_reqs_not_processed`: the worker
+                # arms the lease only for requests it is still tracking.
                 self._push_job_aborts.add(request.request_id)
                 self._reqs_need_send[request.request_id] = (
                     time.perf_counter() + self._kv_lease_duration
@@ -446,10 +452,8 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             tracker.pushed = True
 
     def has_pending_push_work(self) -> bool:
-        # Keep the engine main loop alive while we have:
-        # - finished or aborted P blocks awaiting WRITE completion, or
-        # - pending D registrations the worker has not yet shipped, or
-        # - newly finished blocks not yet shipped to P workers.
+        # Keep the engine main loop alive while P blocks await WRITE
+        # completion (finished or aborted) or D registrations await shipping.
         return bool(self._finished_request_blocks or self._push_pending_registrations)
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:

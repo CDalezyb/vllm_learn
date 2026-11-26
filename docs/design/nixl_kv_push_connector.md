@@ -29,9 +29,12 @@ and P and D with the same TP, for requests with `max_tokens=1`. In other
 configurations a warning is logged and requests are pushed when they finish.
 
 Early push changes only when blocks are written. Block lifetimes are those of
-the push at finish: a running request owns its blocks, preemption and abort
-release them, and a finished request holds them under the KV lease
-(`kv_lease_duration`), which D's heartbeats extend.
+the push at finish: a running request owns its blocks; preemption releases them
+once the submitted WRITEs settle; an abort releases them at once unless a push
+job already reached the worker, in which case they are held under the send
+lease until the worker reports the WRITEs or the settle deadline passes; and a
+finished request holds them under the KV lease (`kv_lease_duration`), which D's
+heartbeats extend.
 
 * In the step that computes the end of the prompt, the scheduler hands the
   prompt's blocks to the worker as a push job. The writer writes them to D,
@@ -53,11 +56,14 @@ release them, and a finished request holds them under the KV lease
   job if it is still queued and waits for its submitted WRITEs before the
   blocks can be reused. A preempted request is pushed again once recomputed,
   unless D was already notified, which async scheduling allows before the
-  request finishes.
-* An aborted request's job is dropped the same way, but its blocks are not
-  waited for: `request_finished` keeps them under the send lease and the
-  writer reports the request as sent once its submitted WRITEs are done, so
-  the engine thread never waits on a cancelled request.
+  request finishes. If the WRITEs do not settle within the settle deadline, the
+  job is abandoned: its state keeps refusing the recompute job, and the request
+  is pushed when it finishes.
+* An aborted request's job is dropped the same way, but its blocks are never
+  waited for: `request_finished` keeps them under the send lease and the writer
+  reports the request as sent once its submitted WRITEs are done (or the settle
+  deadline passes), so the engine thread is not blocked on a cancelled request.
+  An abort whose job was still queued releases the blocks at once.
 
 D only reads its blocks after the completion notification, so the D-side
 scheduler and decode admission path are unchanged.
