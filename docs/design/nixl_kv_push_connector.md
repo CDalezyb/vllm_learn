@@ -49,11 +49,15 @@ release them, and a finished request holds them under the KV lease
   waits for its registration. D is notified at most once: if sending the
   notification fails, it may still have reached D, so the request is left to
   the lease, as a failed push is.
-* When a request with a push job is preempted or aborted, `handle_preemptions`
-  drops the job if it is still queued and waits for its submitted WRITEs
-  before the blocks can be reused. A preempted request is pushed again once
-  recomputed, unless D was already notified, which async scheduling allows
-  before the request finishes.
+* When a request with a push job is preempted, `handle_preemptions` drops the
+  job if it is still queued and waits for its submitted WRITEs before the
+  blocks can be reused. A preempted request is pushed again once recomputed,
+  unless D was already notified, which async scheduling allows before the
+  request finishes.
+* An aborted request's job is dropped the same way, but its blocks are not
+  waited for: `request_finished` keeps them under the send lease and the
+  writer reports the request as sent once its submitted WRITEs are done, so
+  the engine thread never waits on a cancelled request.
 
 D only reads its blocks after the completion notification, so the D-side
 scheduler and decode admission path are unchanged.

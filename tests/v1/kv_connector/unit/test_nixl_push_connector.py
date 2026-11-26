@@ -404,20 +404,44 @@ class TestEarlyPushScheduler:
         (job,) = sched.build_connector_meta(output).push_jobs
         assert job.block_ids == [1, 2, 3]
 
-    @pytest.mark.parametrize("tracked", [True, False])
-    def test_only_tracked_aborts_reach_the_worker(self, tracked):
+    @pytest.mark.parametrize(
+        ("tracked", "pushed"), [(True, True), (True, False), (False, False)]
+    )
+    def test_abort_holds_the_blocks_only_once_the_job_is_pushed(self, tracked, pushed):
+        """An aborted request keeps its blocks under the send lease when a
+        push job may still be written to them, and frees them right away
+        otherwise."""
         from vllm.v1.request import RequestStatus
 
         sched, request, output = self._scheduler_with_request()
         if not tracked:  # e.g. the scheduler pushes requests when they finish
             sched._push_trackers.clear()
+        if pushed:
+            output.num_scheduled_tokens = {request.request_id: 40}
+            assert sched.build_connector_meta(output).push_jobs
         request.status = RequestStatus.FINISHED_ABORTED
-        sched.request_finished(request, ([1, 2, 3],))
+
+        assert sched.request_finished(request, ([1, 2, 3],)) == (pushed, None)
 
         output.num_scheduled_tokens = {}
         meta = sched.build_connector_meta(output)
-        assert meta.push_job_aborts == ({request.request_id} if tracked else set())
-        assert request.request_id in meta.reqs_not_processed
+        # Only a pushed job has WRITEs that may still read the blocks.
+        assert meta.push_job_aborts == ({request.request_id} if pushed else set())
+        assert sched.has_pending_push_work() is pushed
+        assert (request.request_id in meta.reqs_to_send) is pushed
+        # A leased request stays tracked by the worker for its lease; a plain
+        # abort only stops it from being scheduled.
+        assert (request.request_id in meta.reqs_not_processed) is not pushed
+
+        # The worker's report of a written request ends the lease, which lets
+        # the engine free the blocks.
+        sched.update_connector_output(
+            KVConnectorOutput(
+                finished_sending={request.request_id} if pushed else set()
+            )
+        )
+        assert not sched.has_pending_push_work()
+        assert request.request_id not in sched._finished_request_blocks
         assert sched.build_connector_meta(output).push_job_aborts == set()
 
 
@@ -566,6 +590,31 @@ def _push_worker() -> _StubWriterWorker:
     w._xfer_blocks_for_req = xfer
     w.notifs = []
     w._send_completion_notif = lambda reg_data: w.notifs.append(reg_data["request_id"])
+    return w
+
+
+def _pollable_worker() -> _StubWriterWorker:
+    """Stub worker with the extra base-worker state the real
+    `get_transfer_results` needs to poll `_sending_transfers`."""
+    w = _StubWriterWorker.fresh()
+    w.transfer_topo = MagicMock()
+    w.nixl_wrapper = MagicMock()
+    w.xfer_stats = MagicMock()
+    w._log_failure = MagicMock()  # type: ignore[method-assign]
+    w._invalid_block_ids = queue.Queue()
+    w._pending_recv_notifs = {}
+    w._replicated_pcp_done_sending = set()
+    w.use_host_buffer = False
+    return w
+
+
+def _pollable_push_worker() -> _StubWriterWorker:
+    """An early-push worker that can also poll its WRITEs."""
+    w = _push_worker()
+    w.transfer_topo = MagicMock()
+    w._invalid_block_ids = queue.Queue()
+    w._replicated_pcp_done_sending = set()
+    w.use_host_buffer = False
     return w
 
 
@@ -789,6 +838,55 @@ def test_queued_job_of_a_retired_request_is_dropped():
     assert _retire(w, preempted=False).is_set()
     assert w._push_deferred == []
     assert w.writes == []
+
+
+@pytest.mark.parametrize("preempted", [True, False])
+def test_only_a_preemption_is_waited_on(preempted):
+    """A preempted request's blocks are reused in this step, so the engine
+    waits for its WRITEs; an aborted request's blocks are leased instead."""
+    w = _push_worker()
+    w._lease_extension = 0  # a wait would time out immediately
+    w.nixl_wrapper.check_xfer_state.return_value = "PROC"
+    _publish(w, _push_job())
+    w._process_push_jobs()
+    assert w.writes
+
+    meta = NixlConnectorMetadata()
+    if preempted:
+        meta.push_job_preemptions = {"req-p"}
+    else:
+        meta.push_job_aborts = {"req-p"}
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker.logger"
+    ) as logger:
+        w.handle_preemptions(meta)
+
+    # Only the preemption waits, and its timeout is reported.
+    assert logger.error.called is preempted
+
+
+def test_aborted_request_is_reported_as_sent_without_notifying_d():
+    """The writer drops the job and reports the request as sent once its
+    WRITEs are done, which is what ends the block lease. D is never notified
+    for a cancelled request."""
+    w = _pollable_push_worker()
+    w._reqs_to_send["req-p"] = time.perf_counter() + 60
+    w._reqs_to_process.add("req-p")
+    w.nixl_wrapper.check_xfer_state.return_value = "PROC"
+    _publish(w, _push_job())
+    w._process_push_jobs()
+    assert w.writes
+
+    assert not _retire(w, preempted=False).is_set()
+    assert "req-p" not in w._push_states
+    # Nothing is reported while the WRITE still reads the blocks.
+    assert w.get_transfer_results().finished_sending == set()
+
+    w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+    w._poll_push_transfers()
+    assert w.get_transfer_results().finished_sending == {"req-p"}
+    assert "req-p" not in w._reqs_to_send
+    assert w.notifs == []
 
 
 @pytest.mark.parametrize("notified", [False, True])
@@ -1357,21 +1455,6 @@ class TestPushWriterNotifs:
         assert evicted == ["req-done"]
         assert w._push_writer_wake.is_set()
 
-    @staticmethod
-    def _pollable_worker() -> _StubWriterWorker:
-        """Stub worker with the extra base-worker state the real
-        `get_transfer_results` needs to poll `_sending_transfers`."""
-        w = _StubWriterWorker.fresh()
-        w.transfer_topo = MagicMock()
-        w.nixl_wrapper = MagicMock()
-        w.xfer_stats = MagicMock()
-        w._log_failure = MagicMock()  # type: ignore[method-assign]
-        w._invalid_block_ids = queue.Queue()
-        w._pending_recv_notifs = {}
-        w._replicated_pcp_done_sending = set()
-        w.use_host_buffer = False
-        return w
-
     def _make_sending_req(self, w: _StubWriterWorker) -> str:
         request_id = "req-send-1"
         w._sending_transfers[request_id] = [101, 102]
@@ -1386,7 +1469,7 @@ class TestPushWriterNotifs:
         delivered while D still waits for the data; the request must be
         left to the lease / watchdog instead.
         """
-        w = self._pollable_worker()
+        w = _pollable_worker()
         request_id = self._make_sending_req(w)
         w.nixl_wrapper.check_xfer_state.side_effect = ["ERR", "DONE"]
 
@@ -1404,7 +1487,7 @@ class TestPushWriterNotifs:
         self, pp_size, is_hma
     ):
         """All WRITEs completing lets P reclaim its blocks without a D ACK."""
-        w = self._pollable_worker()
+        w = _pollable_worker()
         w.pp_size = pp_size
         w._is_hma_required = is_hma
         request_id = self._make_sending_req(w)
@@ -1430,7 +1513,7 @@ class TestPushWriterNotifs:
     @pytest.mark.parametrize("sibling_state", ["ERR", "DONE"])
     def test_push_failure_survives_until_lease_expiry(self, sibling_state):
         """A later sibling completion must not turn a failed send into success."""
-        w = self._pollable_worker()
+        w = _pollable_worker()
         request_id = self._make_sending_req(w)
         w.nixl_wrapper.check_xfer_state.side_effect = ["ERR", "PROC", sibling_state]
 
@@ -1452,7 +1535,7 @@ class TestPushWriterNotifs:
         self, release_fails
     ):
         """A submission error remains a failure even if later polls succeed."""
-        w = self._pollable_worker()
+        w = _pollable_worker()
         request_id = self._make_sending_req(w)
         w._apply_prefix_caching = MagicMock(return_value=([[1]], [[1]]))
         w._compute_desc_ids = MagicMock(return_value=[0])
@@ -1492,7 +1575,7 @@ class TestPushWriterNotifs:
     @pytest.mark.parametrize("first_state", ["ERR", "DONE"])
     def test_push_completion_after_expiry_is_not_reported_twice(self, first_state):
         """A WRITE finishing after lease expiry must not complete the request again."""
-        w = self._pollable_worker()
+        w = _pollable_worker()
         request_id = self._make_sending_req(w)
         w.nixl_wrapper.check_xfer_state.side_effect = [
             first_state,

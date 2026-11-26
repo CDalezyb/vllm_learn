@@ -340,9 +340,11 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
     def handle_preemptions(self, metadata: NixlConnectorMetadata) -> None:
         """Have the writer drop the push jobs of preempted and aborted
-        requests, and wait until none of their WRITEs is in flight, so the
-        blocks are not overwritten while being read. A preempted request
-        whose D was not notified yet is pushed again once recomputed."""
+        requests. A preempted request's blocks are reused in this step, so
+        wait until its WRITEs are no longer in flight; an aborted request's
+        blocks stay under the send lease until the writer reports them. A
+        preempted request whose D was not notified yet is pushed again once
+        recomputed."""
         if not self._early_push or not (
             metadata.push_job_preemptions or metadata.push_job_aborts
         ):
@@ -352,11 +354,13 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         )
         self._prefill_inbox.put(retirement)
         self._push_writer_wake.set()
+        if not retirement.preempted:
+            return
         if not retirement.done.wait(self._lease_extension):
             logger.error(
                 "NIXL push WRITEs of requests %s did not complete within %ds; "
                 "their blocks may be reused while still being read.",
-                retirement.preempted | retirement.aborted,
+                retirement.preempted,
                 self._lease_extension,
             )
 
@@ -606,6 +610,11 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             ):
                 continue
             self._push_retirements.remove(retirement)
+            # An aborted request's blocks are held by the send lease, which
+            # ends when the engine hears the request as sent.
+            with self._sending_transfers_lock:
+                for req_id in retirement.aborted:
+                    self._sending_transfers[req_id] = []
             retirement.done.set()
 
     def _notify_pushed_requests(self) -> None:

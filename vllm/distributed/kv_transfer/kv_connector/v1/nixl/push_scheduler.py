@@ -293,16 +293,28 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         if not is_p_node:
             return False, None
 
-        tracked = (
-            self._early_push
-            and self._push_trackers.pop(request.request_id, None) is not None
+        tracker = (
+            self._push_trackers.pop(request.request_id, None)
+            if self._early_push
+            else None
         )
         if request.status not in (
             RequestStatus.FINISHED_LENGTH_CAPPED,
             RequestStatus.FINISHED_STOPPED,
         ):
-            if tracked:
+            if tracker is not None and tracker.pushed:
+                # A push job is already with the worker, so its WRITEs may
+                # still read this request's blocks. Keep the blocks under the
+                # send lease until the worker reports them as written, which
+                # the engine thread does not wait for.
                 self._push_job_aborts.add(request.request_id)
+                self._reqs_need_send[request.request_id] = (
+                    time.perf_counter() + self._kv_lease_duration
+                )
+                self._finished_request_blocks[request.request_id] = (
+                    self.get_exchange_clipped_blocks(block_ids)
+                )
+                return True, None
             self._reqs_not_processed.add(request.request_id)
             self._reqs_need_save.pop(request.request_id, None)
             return False, None
@@ -435,7 +447,7 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
 
     def has_pending_push_work(self) -> bool:
         # Keep the engine main loop alive while we have:
-        # - finished P blocks awaiting WRITE completion, or
+        # - finished or aborted P blocks awaiting WRITE completion, or
         # - pending D registrations the worker has not yet shipped, or
         # - newly finished blocks not yet shipped to P workers.
         return bool(self._finished_request_blocks or self._push_pending_registrations)
