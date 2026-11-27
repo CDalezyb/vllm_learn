@@ -564,7 +564,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         try:
             handles = self._push_blocks(
                 job.request_id,
-                (job.block_ids,),
+                job.block_ids,
                 self._as_grouped_block_ids(reg_data["local_block_ids"]),
                 reg_data,
                 notify=False,

@@ -371,7 +371,7 @@ class TestEarlyPushScheduler:
         output.num_scheduled_tokens = {request.request_id: 8}
         (job,) = sched.build_connector_meta(output).push_jobs
         # The prompt's blocks only, its partial last block included.
-        assert (job.request_id, job.block_ids) == (request.request_id, [1, 2, 3])
+        assert (job.request_id, job.block_ids) == (request.request_id, ([1, 2, 3],))
 
         request.num_computed_tokens = 40
         output.num_scheduled_tokens = {request.request_id: 1}
@@ -402,7 +402,7 @@ class TestEarlyPushScheduler:
         output.preempted_req_ids = set()
         output.num_scheduled_tokens = {request.request_id: 40}
         (job,) = sched.build_connector_meta(output).push_jobs
-        assert job.block_ids == [1, 2, 3]
+        assert job.block_ids == ([1, 2, 3],)
 
     @pytest.mark.parametrize("tracked", [True, False])
     def test_only_tracked_aborts_reach_the_worker(self, tracked):
@@ -570,7 +570,7 @@ def _push_worker() -> _StubWriterWorker:
 
 
 def _push_job(request_id: str = "req-p") -> NixlPushJob:
-    return NixlPushJob(request_id=request_id, block_ids=[1, 2])
+    return NixlPushJob(request_id=request_id, block_ids=([1, 2],))
 
 
 def _publish(w: _StubWriterWorker, *jobs: NixlPushJob, ready: bool = True):
@@ -702,7 +702,7 @@ def test_job_that_raises_fails_only_its_request():
     )
     # Raises KeyError for req-p's job.
     w._push_path_supported = lambda reg_data: {"req-q": True}[reg_data["request_id"]]
-    _publish(w, _push_job(), NixlPushJob("req-q", [5]))
+    _publish(w, _push_job(), NixlPushJob("req-q", ([5],)))
     w._process_push_jobs()
     assert w._push_states["req-p"].failed
     assert w.writes == [(([5],), ((200,),), False)]

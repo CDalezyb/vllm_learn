@@ -42,7 +42,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
-from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+from vllm.v1.core.single_type_kv_cache_manager import (
+    CrossAttentionManager,
+    FullAttentionManager,
+)
+from vllm.v1.kv_cache_interface import AttentionSpec
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -320,7 +324,7 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
                 time.perf_counter() + self._kv_lease_duration
             )
 
-            block_ids = self.get_exchange_clipped_blocks(block_ids)
+            block_ids = self._transfer_block_ids(block_ids)
             remote_num_tokens = request.num_computed_tokens
 
             # Store finished blocks for worker-level matching with D
@@ -392,6 +396,39 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
 
         return meta
 
+    def _transfer_block_ids(
+        self,
+        block_ids: BlockIds,
+        num_tokens: int | None = None,
+    ) -> BlockIds:
+        """Select the blocks to transfer to D.
+
+        Early push passes the prompt length as `num_tokens` so each attention
+        group is capped at the blocks covering the prompt; the block table can
+        include lookahead blocks that the request has not computed yet.
+        Non-attention groups keep their full block list:
+        `get_exchange_clipped_blocks` clips them to their state-bearing slot,
+        and truncating them here would drop that slot before the clip sees it.
+
+        The group test mirrors `KVCacheManager.get_block_ids_for_computed_tokens`.
+        """
+        if num_tokens is not None:
+            groups = self.kv_cache_config.kv_cache_groups
+            assert len(block_ids) == len(groups), (
+                f"Expected {len(groups)} KV cache groups, got {len(block_ids)}"
+            )
+            block_ids = tuple(
+                ids[: cdiv(num_tokens, group.block_size)]
+                if all(
+                    isinstance(spec, AttentionSpec)
+                    for spec in group.distinct_specs
+                )
+                and not issubclass(group.manager_cls, CrossAttentionManager)
+                else ids
+                for ids, group in zip(block_ids, groups)
+            )
+        return self.get_exchange_clipped_blocks(block_ids)
+
     def _build_push_jobs(
         self,
         meta: NixlConnectorMetadata,
@@ -404,7 +441,6 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
 
         block_state = scheduler_output.kv_connector_block_state
         assert block_state is not None
-        block_size = self.kv_cache_config.transfer_groups[0].block_size
 
         for (
             req_id,
@@ -421,14 +457,13 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
                 continue
             all_block_ids = block_state.get_block_ids(req_id)
             assert all_block_ids is not None
-            transfer_block_ids = self.kv_cache_config.select_transfer_block_ids(
-                all_block_ids
+            transfer_block_ids = self._transfer_block_ids(
+                all_block_ids, request.num_prompt_tokens
             )
-            num_blocks = cdiv(request.num_prompt_tokens, block_size)
             meta.push_jobs.append(
                 NixlPushJob(
                     request_id=req_id,
-                    block_ids=list(transfer_block_ids[0][:num_blocks]),
+                    block_ids=transfer_block_ids,
                 )
             )
             tracker.pushed = True

@@ -274,11 +274,14 @@ class ReqMeta:
 
 @dataclass(frozen=True)
 class NixlPushJob:
-    """The prompt blocks of a request whose prompt is computed in this step,
-    with their ids in its full-attention block table."""
+    """A request's prompt blocks to send in the step that finishes its prompt.
+
+    `block_ids` holds one block-id list per transferable KV cache group,
+    selected the same way as the push at finish.
+    """
 
     request_id: ReqId
-    block_ids: list[int]
+    block_ids: BlockIds
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
