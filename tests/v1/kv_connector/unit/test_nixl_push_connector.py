@@ -377,6 +377,33 @@ class TestEarlyPushScheduler:
         output.num_scheduled_tokens = {request.request_id: 1}
         assert sched.build_connector_meta(output).push_jobs == []
 
+    def test_push_job_covers_every_kv_cache_group(self):
+        vllm_config = create_vllm_config(
+            kv_connector="NixlPushConnector",
+            kv_role="kv_producer",
+            kv_connector_extra_config={"enable_early_push": True},
+        )
+        kv_cache_config = make_kv_cache_config(
+            block_size=16, num_blocks=8, mamba_enabled=True
+        )
+        sched = NixlPushConnectorScheduler(
+            vllm_config, "test-prefill-engine", kv_cache_config
+        )
+        request = create_request(num_tokens=40, block_size=16, do_remote_decode=True)
+        sched.update_state_after_alloc(
+            request, _BlocksMock(([1, 2, 3], [4, 5, 6])), 0
+        )
+        output = SchedulerOutput.make_empty()
+        output.preempted_req_ids = set()
+        output.kv_connector_block_state = KVConnectorBlockState(
+            req_ids={request.request_id},
+            resolve_block_ids=lambda _: ([1, 2, 3], [4, 5, 6]),
+            boundary_state_offloads={},
+        )
+        output.num_scheduled_tokens = {request.request_id: 40}
+        (job,) = sched.build_connector_meta(output).push_jobs
+        assert job.block_ids == ([1, 2, 3], [6])
+
     def test_request_generating_more_tokens_is_pushed_when_it_finishes(self):
         sched, _, output = self._scheduler_with_request()
         request = create_request(num_tokens=40, block_size=16, do_remote_decode=True)
