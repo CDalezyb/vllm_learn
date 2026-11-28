@@ -1045,6 +1045,30 @@ class EngineCore:
                 raise
             self._fail_checkpoint(e)
 
+    def dev_set_token_budget(self, budget: int) -> dict[str, int]:
+        """Change the scheduler's token budget on a running engine.
+
+        Development-time only: the control endpoint is gated on
+        `VLLM_DEV_HOTSWAP` and `VLLM_SERVER_DEV_MODE`.
+
+        Args:
+            budget: New per-step token budget.
+
+        Returns:
+            The installed budget and the envelope it must stay within.
+        """
+        from vllm.dev.state import dev_enabled
+
+        if not dev_enabled():
+            raise RuntimeError("VLLM_DEV_HOTSWAP is not enabled")
+        set_budget = getattr(self.scheduler, "dev_set_token_budget", None)
+        if set_budget is None:
+            raise RuntimeError(
+                f"{type(self.scheduler).__name__} does not support a token "
+                "budget swap"
+            )
+        return set_budget(int(budget))
+
     def pause_scheduler(
         self,
         mode: PauseMode = "abort",

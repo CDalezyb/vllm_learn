@@ -30,6 +30,7 @@ from vllm.config.compilation import (
     decode_cudagraph_capture_max_tokens,
     decode_cudagraph_capture_shapes,
 )
+from vllm.dev.state import dev_state
 from vllm.distributed.parallel_state import (
     get_pp_group,
     graph_capture,
@@ -207,6 +208,8 @@ class CudaGraphManager:
         self.capture_stream: torch.cuda.Stream | None = None
 
         self._graphs_captured = False
+        # Swap epoch the captured graphs were recorded under; see run_fullgraph.
+        self._dev_capture_epoch: int | None = None
 
         # Profiling hooks, set only by profile_cudagraph_memory() below: cap
         # FULL-mode capture at the N largest descriptors and record each
@@ -442,6 +445,7 @@ class CudaGraphManager:
         """
         self.graphs.clear()
         self._graphs_captured = False
+        self._dev_capture_epoch = None
         if self.breakable_cg_runner is not None:
             BreakableCUDAGraphWrapper.clear_all_graphs()
 
@@ -551,6 +555,7 @@ class CudaGraphManager:
                         compilation_counter.num_cudagraph_captured += 1
 
         self._graphs_captured = True
+        self._dev_capture_epoch = dev_state().epoch
 
     def captured_token_counts(self) -> list[int]:
         """Sorted token counts with a captured graph, ignoring LoRA variants."""
@@ -617,7 +622,23 @@ class CudaGraphManager:
         # cannot see. Without this, replay could overwrite static buffers
         # while those copies are still in flight.
         get_offloader().sync_prev_onload()
+        self.check_dev_epoch(desc)
         self.graphs[desc].replay()
+
+    def check_dev_epoch(self, desc: BatchExecutionDescriptor) -> None:
+        """Refuse to replay a graph captured before an op swap.
+
+        A replay runs the kernel launches recorded at capture time, so an op
+        swapped in afterwards would never run. Measuring it through the graph
+        would report the old provider's cost under the new provider's name.
+        """
+        epoch = dev_state().epoch
+        if self._dev_capture_epoch is not None and self._dev_capture_epoch != epoch:
+            raise RuntimeError(
+                f"CUDA graph {desc} was captured under op swap epoch "
+                f"{self._dev_capture_epoch}, the runtime is at {epoch}. "
+                "Re-capture the graphs before replaying them."
+            )
 
     def init_breakable_cg_runner(
         self, model: nn.Module, key_fn: Callable[..., Hashable] | None = None

@@ -159,6 +159,8 @@ class Scheduler(SchedulerInterface):
             if self.scheduler_config.max_num_scheduled_tokens is not None
             else self.scheduler_config.max_num_batched_tokens
         )
+        # Development-time override of the step budget, see dev_set_token_budget.
+        self._dev_token_budget: int | None = None
         self.adaptive_long_prefill_threshold = (
             self.scheduler_config.long_prefill_token_threshold_adaptive
         )
@@ -729,6 +731,35 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def dev_set_token_budget(self, budget: int) -> dict[str, int]:
+        """Change the per-step token budget of a running engine.
+
+        The budget may only go down. The KV cache, the input buffers and the
+        CUDA graphs were sized for the budget the engine started with, and a
+        wider one would address memory that was never allocated.
+
+        Args:
+            budget: New per-step token budget.
+
+        Returns:
+            The installed budget and the envelope it must stay within.
+
+        Raises:
+            ValueError: The budget is not positive or exceeds the envelope.
+        """
+        envelope = self.scheduler_config.max_num_batched_tokens
+        if budget <= 0:
+            raise ValueError(f"token budget must be positive, got {budget}")
+        if budget > envelope:
+            raise ValueError(
+                f"token budget {budget} exceeds the envelope {envelope} the "
+                "engine was started with; restart with a larger "
+                "--max-num-batched-tokens"
+            )
+        self._dev_token_budget = budget
+        self.max_num_scheduled_tokens = budget
+        return {"token_budget": budget, "envelope": envelope}
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -758,7 +789,11 @@ class Scheduler(SchedulerInterface):
         token_budget = self.max_num_scheduled_tokens
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
-        input_budget = self.scheduler_config.max_num_batched_tokens
+        input_budget = (
+            self._dev_token_budget
+            if self._dev_token_budget is not None
+            else self.scheduler_config.max_num_batched_tokens
+        )
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0

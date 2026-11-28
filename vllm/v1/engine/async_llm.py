@@ -1383,6 +1383,12 @@ class AsyncLLM(EngineClient):
             method, timeout, args, kwargs
         )
 
+    async def dev_set_token_budget(self, budget: int) -> dict[str, int]:
+        """Change the scheduler's token budget without restarting (dev only)."""
+        return await self.engine_core.call_utility_async(
+            "dev_set_token_budget", budget
+        )
+
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""
         start_time = time.time()

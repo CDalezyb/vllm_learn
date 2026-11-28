@@ -1307,6 +1307,38 @@ class Worker(WorkerBase):
             num_kv_blocks=num_kv_blocks,
         )
 
+    def dev_apply_ops(self, payload_json: str) -> dict[str, Any]:
+        """Swap op implementations in this worker (dev only)."""
+        from vllm.dev.worker import apply_ops
+
+        return apply_ops(payload_json)
+
+    def dev_identity(self) -> dict[str, Any]:
+        """Report the op providers this worker is running (dev only)."""
+        from vllm.dev.worker import identity
+
+        return identity()
+
+    def dev_recapture_cudagraphs(self) -> dict[str, Any]:
+        """Re-capture the decode graphs so they run the current ops (dev only)."""
+        from vllm.dev.state import dev_enabled
+
+        if not dev_enabled():
+            raise RuntimeError("VLLM_DEV_HOTSWAP is not enabled")
+        runner = self.model_runner
+        manager = runner.cudagraph_manager
+        if manager is None:
+            return {"captured": 0, "reason": "cudagraph disabled"}
+        start = time.perf_counter()
+        manager.release_graphs()
+        with self._get_cudagraph_capture_context():
+            runner.capture_model()
+        return {
+            "captured": len(manager.graphs),
+            "seconds": round(time.perf_counter() - start, 3),
+            "epoch": manager._dev_capture_epoch,
+        }
+
     def _maybe_activate_jit_monitor(self) -> None:
         # When JIT warmup is disabled (e.g. enforce_eager), runtime JIT
         # compilation is expected, so monitoring would only produce noise

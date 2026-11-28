@@ -305,6 +305,10 @@ class EngineClient(ABC):
         """Perform a collective RPC call to the given path."""
         raise NotImplementedError
 
+    async def dev_set_token_budget(self, budget: int) -> dict[str, int]:
+        """Change the scheduler's token budget without restarting (dev only)."""
+        raise NotImplementedError
+
     async def compute_weight_checksums(self) -> list[dict[str, str]]:
         """Return rank-qualified weight digests from every worker of every engine."""
         raise NotImplementedError
