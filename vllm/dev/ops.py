@@ -120,6 +120,12 @@ def set_priority(priority: dict[str, list[str]]) -> dict[str, list[str]]:
     installed: dict[str, list[str]] = {}
     for name, providers in priority.items():
         op = get_op(name)
+        unknown = [p for p in providers if p not in op.impls]
+        if unknown:
+            raise ValueError(
+                f"op {name!r} has no provider {unknown}; "
+                f"registered: {sorted(op.impls)}"
+            )
         op.set_default(list(providers))
         installed[name] = op.get_priority()
         dev_state().op_priority[name] = installed[name]

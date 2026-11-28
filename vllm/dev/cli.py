@@ -73,7 +73,12 @@ def main(argv: list[str] | None = None) -> int:
     ops.add_argument("--module", help="Python file to import before selecting")
     ops.add_argument("--op", default="rms_norm")
     ops.add_argument("--provider", required=True)
-    ops.add_argument("--native-fallback", action="store_true", default=True)
+    ops.add_argument(
+        "--no-native-fallback",
+        dest="native_fallback",
+        action="store_false",
+        help="do not append the native provider after the swapped one",
+    )
     ops.add_argument("--no-recapture", action="store_true")
 
     subs.add_parser("recapture", help="re-capture decode graphs only")
