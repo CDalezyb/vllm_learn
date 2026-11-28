@@ -455,3 +455,15 @@ steps:
       timeout_in_minutes: 35
       depends_on:
       - image-build-amd
+
+- label: ":pytest: (L4) Dev plank swap"
+  key: dev-plank-swap
+  timeout_in_minutes: 20
+  device: l4
+  num_devices: 1
+  source_file_dependencies:
+    - vllm/dev/
+    - vllm/entrypoints/serve/dev/hotswap/
+    - tests/dev/
+  commands:
+    - pytest -v -s dev/test_dev_ops.py
