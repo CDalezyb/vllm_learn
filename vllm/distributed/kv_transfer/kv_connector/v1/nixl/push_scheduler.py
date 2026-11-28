@@ -116,6 +116,9 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         self._early_push = bool(extra_config.get("enable_early_push", False))
         self._push_trackers: dict[ReqId, _PushJobTracker] = {}
         self._push_job_aborts: set[ReqId] = set()
+        # Requests whose push job was handed to the worker and then dropped by
+        # a preemption; they are pushed as a whole when they finish.
+        self._push_lost: set[ReqId] = set()
 
         if self._early_push:
             parallel_config = vllm_config.parallel_config
@@ -181,11 +184,15 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # matches what the worker expects on the next step.
         if params.get("do_remote_decode"):
             self._reqs_in_batch.add(request.request_id)
-            if self._early_push and request.max_tokens == 1:
+            if (
+                self._early_push
+                and request.max_tokens == 1
+                and request.request_id not in self._push_lost
+            ):
                 # D is notified once the prompt is pushed, so only requests
                 # that finish with the prompt are pushed early; the others are
-                # pushed when they finish. A preempted request is tracked
-                # again once its blocks are allocated again.
+                # pushed when they finish. A preempted request whose job was
+                # handed to the worker is pushed whole when it finishes.
                 self._push_trackers[request.request_id] = _PushJobTracker(request)
 
         # P side with host-buffer offload: defer save to the worker.
@@ -294,11 +301,15 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             self._early_push
             and self._push_trackers.pop(request.request_id, None) is not None
         )
+        lost = request.request_id in self._push_lost
+        self._push_lost.discard(request.request_id)
         if request.status not in (
             RequestStatus.FINISHED_LENGTH_CAPPED,
             RequestStatus.FINISHED_STOPPED,
         ):
-            if tracked:
+            if tracked or lost:
+                # A request preempted before it finished still has a worker
+                # record to drop.
                 self._push_job_aborts.add(request.request_id)
             self._reqs_not_processed.add(request.request_id)
             self._reqs_need_save.pop(request.request_id, None)
@@ -412,10 +423,7 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             )
             block_ids = tuple(
                 ids[: cdiv(num_tokens, group.block_size)]
-                if all(
-                    isinstance(spec, AttentionSpec)
-                    for spec in group.distinct_specs
-                )
+                if all(isinstance(spec, AttentionSpec) for spec in group.distinct_specs)
                 and not issubclass(group.manager_cls, CrossAttentionManager)
                 else ids
                 for ids, group in zip(block_ids, groups)
@@ -428,8 +436,15 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         scheduler_output: SchedulerOutput,
     ) -> None:
         for req_id in scheduler_output.preempted_req_ids or ():
-            if req_id in self._push_trackers:
-                meta.push_job_preemptions.add(req_id)
+            tracker = self._push_trackers.pop(req_id, None)
+            if tracker is None:
+                continue
+            meta.push_job_preemptions.add(req_id)
+            if tracker.pushed:
+                # The worker holds a push job to cancel; the request is
+                # pushed as a whole when it finishes. A request preempted
+                # before its job was emitted stays eligible for early push.
+                self._push_lost.add(req_id)
         meta.push_job_aborts, self._push_job_aborts = self._push_job_aborts, set()
 
         block_state = scheduler_output.kv_connector_block_state

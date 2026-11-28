@@ -77,10 +77,13 @@ release them, and a finished request holds them under the KV lease
   notification fails, it may still have reached D, so the request is left to
   the lease, as a failed push is.
 * When a request with a push job is preempted or aborted, `handle_preemptions`
-  drops the job if it is still queued and waits for its submitted WRITEs
-  before the blocks can be reused. A preempted request is pushed again once
-  recomputed, unless D was already notified, which async scheduling allows
-  before the request finishes.
+  cancels the job: a queued job is dropped, a submitted one is still waited
+  for before the blocks can be reused, and D is not notified for it. A
+  request whose job was handed to the worker is not pushed early again; it is
+  pushed as a whole when it finishes after the recompute. A request preempted
+  before its job was handed over stays eligible for early push. A request D
+  was already notified for keeps that notification, which async scheduling
+  allows before the request finishes, and is not pushed again.
 
 D only reads its blocks after the completion notification, so the D-side
 scheduler and decode admission path are unchanged.
